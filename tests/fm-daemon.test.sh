@@ -1318,6 +1318,25 @@ test_wedge_alarm_hung_channel_times_out_and_falls_through() {
   pass "a hung notifier is bounded, logged, and falls through to the next channel"
 }
 
+test_wedge_alarm_backgrounded_command_times_out_and_reaps_descendant() {
+  local dir daemon_log child_file child command
+  dir=$(make_wedge_case wedge-backgrounded-timeout)
+  daemon_log="$dir/daemon.log"
+  child_file="$dir/notifier-child"
+  command="sleep 30 & printf '%s' \"\$!\" > '$child_file'"
+  LOG="$daemon_log" FM_WEDGE_ALARM_EXEC='' FM_WEDGE_ALARM_TIMEOUT_SECS=1 \
+    wedge_alarm_via_command "$command" "away-mode WEDGED 900s"
+  [ -s "$child_file" ] || fail "the backgrounded notifier did not record its descendant"
+  child=$(cat "$child_file")
+  grep -F 'command notifier timed out' "$daemon_log" >/dev/null \
+    || fail "a backgrounded command notifier bypassed its timeout: $(cat "$daemon_log" 2>/dev/null)"
+  if is_live_non_zombie "$child"; then
+    kill -TERM "$child" 2>/dev/null || true
+    fail "a timed-out command notifier left its descendant running (pid $child)"
+  fi
+  pass "a backgrounded command notifier remains bounded until its process group is reaped"
+}
+
 test_wedge_alarm_hung_override_times_out_and_falls_through() {
   local dir blocker daemon_log start elapsed
   dir=$(make_wedge_case wedge-override-timeout)
@@ -1706,6 +1725,7 @@ test_wedge_alarm_auto_non_darwin_has_no_os_channel
 test_wedge_alarm_config_file_multi_channel
 test_wedge_alarm_failing_channel_degrades_gracefully
 test_wedge_alarm_hung_channel_times_out_and_falls_through
+test_wedge_alarm_backgrounded_command_times_out_and_reaps_descendant
 test_wedge_alarm_hung_override_times_out_and_falls_through
 test_wedge_alarm_shutdown_stops_active_notifier_group
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend

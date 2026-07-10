@@ -744,7 +744,7 @@ wedge_alarm_run_bounded() {
   pid=$!
   WEDGE_ALARM_NOTIFIER_PID=$pid
   start=$SECONDS
-  while kill -0 "$pid" 2>/dev/null; do
+  while kill -0 "-$pid" 2>/dev/null; do
     elapsed=$((SECONDS - start))
     if [ "$elapsed" -ge "$timeout" ]; then
       wedge_alarm_stop_active_notifier
