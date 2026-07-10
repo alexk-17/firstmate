@@ -833,7 +833,7 @@ wedge_alarm_via_command() {  # <cmd> <summary>
     <<< "$summary" >/dev/null 2>&1
   rc=$?
   [ "$rc" -eq 0 ] && return 0
-  log "wedge alarm: command channel exited $rc"
+  log "wedge alarm: command channel exited $rc (command redacted)"
   return 1
 }
 
@@ -863,7 +863,7 @@ wedge_alarm_notify() {  # <summary> <marker>
       '') log "wedge alarm: no OS-level alert channel on $(uname); durable marker $marker is the only signal - set config/wedge-alarm (e.g. a command: directive)" ;;
       osascript|herdr) wedge_alarm_emit "$ch" "$summary" || true ;;
       command:*) wedge_alarm_via_command "${ch#command:}" "$summary" || true ;;
-      *) log "wedge alarm: unknown active-alert channel '$ch' (marker $marker still written)" ;;
+      *) log "wedge alarm: unrecognized active-alert channel directive (redacted); marker still written" ;;
     esac
   done < <(wedge_alarm_configured_channels)
   return 0

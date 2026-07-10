@@ -1219,11 +1219,26 @@ test_wedge_alarm_command_failure_hides_configured_command() {
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
   rc=$?
   [ "$rc" -eq 0 ] || fail "a failed command channel made wedge_alarm_notify return non-zero ($rc)"
-  grep -F 'command channel exited 73' "$daemon_log" >/dev/null \
+  grep -F 'command channel exited 73 (command redacted)' "$daemon_log" >/dev/null \
     || fail "command channel failure did not log its exit status: $(cat "$daemon_log" 2>/dev/null)"
   grep -F "$secret" "$daemon_log" >/dev/null \
     && fail "command channel failure leaked its configured command: $(cat "$daemon_log")"
-  pass "command channel failures log only their safe exit status"
+  pass "command channel failures redact configured commands while logging their exit status"
+}
+
+test_wedge_alarm_unknown_channel_hides_configured_directive() {
+  local dir daemon_log secret rc
+  dir=$(make_wedge_case wedge-unknown-redaction); daemon_log="$dir/daemon.log"
+  secret="https://alerts.example.invalid/hook?token=private-wedge-token"
+  LOG="$daemon_log" FM_WEDGE_ALARM_CHANNEL="webhook:$secret" \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "an unknown channel made wedge_alarm_notify return non-zero ($rc)"
+  grep -F 'unrecognized active-alert channel directive (redacted); marker still written' "$daemon_log" >/dev/null \
+    || fail "an unknown channel did not log the redacted directive category: $(cat "$daemon_log" 2>/dev/null)"
+  grep -F "$secret" "$daemon_log" >/dev/null \
+    && fail "an unknown channel leaked its configured directive: $(cat "$daemon_log")"
+  pass "unknown channel directives are redacted while the alarm keeps running"
 }
 
 test_wedge_alarm_off_disables_active_alert() {
@@ -1657,6 +1672,7 @@ test_wedge_alarm_osascript_channel_selected
 test_wedge_alarm_herdr_channel_selected
 test_wedge_alarm_command_channel_receives_summary
 test_wedge_alarm_command_failure_hides_configured_command
+test_wedge_alarm_unknown_channel_hides_configured_directive
 test_wedge_alarm_off_disables_active_alert
 test_wedge_alarm_auto_darwin_selects_osascript
 test_wedge_alarm_auto_non_darwin_has_no_os_channel
