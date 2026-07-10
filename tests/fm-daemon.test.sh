@@ -1227,6 +1227,45 @@ test_wedge_alarm_failing_channel_degrades_gracefully() {
   pass "a failing channel logs and falls back to the next channel, never crashing the alarm"
 }
 
+test_wedge_alarm_hung_channel_times_out_and_falls_through() {
+  local dir log daemon_log start elapsed
+  dir=$(make_wedge_case wedge-timeout); log="$dir/alert.log"; daemon_log="$dir/daemon.log"
+  start=$SECONDS
+  LOG="$daemon_log" FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_TIMEOUT_SECS=1 \
+    FM_WEDGE_ALARM_CHANNEL=$'command:sleep 30\nosascript' \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  elapsed=$((SECONDS - start))
+  [ "$elapsed" -lt 5 ] || fail "a hung wedge notifier blocked the alarm for ${elapsed}s"
+  grep -F 'command notifier timed out' "$daemon_log" >/dev/null \
+    || fail "a hung wedge notifier did not log its timeout: $(cat "$daemon_log" 2>/dev/null)"
+  grep -F 'osascript' "$log" >/dev/null \
+    || fail "a timed-out command notifier prevented the next channel: $(cat "$log")"
+  pass "a hung notifier is bounded, logged, and falls through to the next channel"
+}
+
+test_wedge_alarm_hung_override_times_out_and_falls_through() {
+  local dir blocker out daemon_log channel start elapsed
+  dir=$(make_wedge_case wedge-override-timeout)
+  blocker="$dir/blocker"; out="$dir/override-fallback"; daemon_log="$dir/daemon.log"
+  cat > "$blocker" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+  chmod +x "$blocker"
+  channel="command: printf '%s' \"\$1\" > '$out'"
+  start=$SECONDS
+  LOG="$daemon_log" FM_WEDGE_ALARM_EXEC="$blocker" FM_WEDGE_ALARM_TIMEOUT_SECS=1 \
+    FM_WEDGE_ALARM_CHANNEL=$'osascript\n'"$channel" \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  elapsed=$((SECONDS - start))
+  [ "$elapsed" -lt 5 ] || fail "a hung wedge notifier override blocked the alarm for ${elapsed}s"
+  grep -F 'osascript notifier timed out' "$daemon_log" >/dev/null \
+    || fail "a hung notifier override did not log its timeout: $(cat "$daemon_log" 2>/dev/null)"
+  [ "$(cat "$out" 2>/dev/null)" = "away-mode WEDGED 900s" ] \
+    || fail "a timed-out notifier override prevented the next channel"
+  pass "a hung notifier override is bounded, logged, and falls through to the next channel"
+}
+
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend() {
   # The whole incident: a non-tmux (herdr) primary gets NO tmux status-line
   # flash, so inject_wedge_alarm must still emit the backend-independent alert
@@ -1546,6 +1585,8 @@ test_wedge_alarm_auto_darwin_selects_osascript
 test_wedge_alarm_auto_non_darwin_has_no_os_channel
 test_wedge_alarm_config_file_multi_channel
 test_wedge_alarm_failing_channel_degrades_gracefully
+test_wedge_alarm_hung_channel_times_out_and_falls_through
+test_wedge_alarm_hung_override_times_out_and_falls_through
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend
 test_fm_send_exits_nonzero_on_confirmed_swallow
 test_fm_send_exits_nonzero_on_initial_send_failure

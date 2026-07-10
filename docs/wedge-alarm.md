@@ -30,6 +30,8 @@ Default-on is deliberate: the alarm's entire purpose is that a wedged away-mode 
 The alarm is rate-limited to at most once per max-defer window, and fires only after a genuine wedge past max-defer, so the default-on banner is rare and never chatty.
 
 Each channel is best-effort: a missing binary or a non-zero exit logs a warning and the alarm falls through to the next channel, never crashing the daemon loop.
+Every invocation is also process-group bounded by `FM_WEDGE_ALARM_TIMEOUT_SECS` (10 seconds by default), including `command:`, `osascript`, `herdr`, and an `FM_WEDGE_ALARM_EXEC` override.
+On timeout its watchdog terminates the notifier, logs the timeout, and continues to the next configured channel.
 The AppleScript passes the summary as an `argv` item rather than interpolating it into the script source, so summary text can never break the notification.
 See `docs/examples/wedge-alarm` for a copyable starting config.
 

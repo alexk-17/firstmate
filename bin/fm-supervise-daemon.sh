@@ -115,6 +115,10 @@
 #                                   daemon defaults this to "discard" so no test
 #                                   can post a real notification (wedge_alarm_emit
 #                                   and the library-mode guard at the foot).
+#          FM_WEDGE_ALARM_TIMEOUT_SECS seconds allowed for each notifier before
+#                                   its watchdog terminates it and continues to the
+#                                   next channel (default 10; invalid/zero uses the
+#                                   default).
 #          FM_INJECT_CONFIRM_RETRIES Enter-retry attempts on a swallowed Enter
 #                                   (default 3); the digest is typed once, only
 #                                   Enter is retried. Composer-empty detection is
@@ -179,6 +183,7 @@ HOUSEKEEPING_TICK_DEFAULT=15
 # the normal flush path and, if that cannot confirm a submit, raises a loud wedge
 # alarm. The escape hatch makes a guard false-positive visible instead of silent.
 MAX_DEFER_SECS_DEFAULT=300
+WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 # The captain-relevant verb set and the status classifiers (last_status_line,
 # status_is_captain_relevant, window_to_task, scan_captain_relevant_statuses) now
 # live in bin/fm-classify-lib.sh, shared with the always-on watcher.
@@ -718,6 +723,40 @@ wedge_alarm_platform_default() {
   esac
 }
 
+wedge_alarm_run_bounded() {
+  local channel=$1 timeout monitor_was_on=0 pid start elapsed rc
+  shift
+  timeout=${FM_WEDGE_ALARM_TIMEOUT_SECS:-$WEDGE_ALARM_TIMEOUT_SECS_DEFAULT}
+  case "$timeout" in
+    ''|*[!0-9]*) timeout=$WEDGE_ALARM_TIMEOUT_SECS_DEFAULT ;;
+    *) [ "$timeout" -gt 0 ] 2>/dev/null || timeout=$WEDGE_ALARM_TIMEOUT_SECS_DEFAULT ;;
+  esac
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m 2>/dev/null || true
+  case $- in
+    *m*) ;;
+    *) log "wedge alarm: ${channel} notifier skipped because its watchdog could not start"; return 125 ;;
+  esac
+  "$@" &
+  pid=$!
+  start=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    elapsed=$((SECONDS - start))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.2
+      kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+      log "wedge alarm: ${channel} notifier timed out after ${elapsed}s (limit ${timeout}s)"
+      return 124
+    fi
+    sleep 0.1
+  done
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+  return "$rc"
+}
+
 # Post a macOS Notification Center banner. `display notification` is OS-level,
 # independent of any terminal pane or multiplexer status-line. The summary is
 # passed as an argv item (never interpolated into the AppleScript source) so its
@@ -726,7 +765,7 @@ wedge_alarm_via_osascript() {  # <summary>
   local summary=$1
   command -v osascript >/dev/null 2>&1 || {
     log "wedge alarm: osascript not found; cannot post a macOS notification"; return 1; }
-  osascript -e 'on run argv' \
+  wedge_alarm_run_bounded osascript osascript -e 'on run argv' \
     -e 'display notification (item 1 of argv) with title "firstmate: away-mode escalations WEDGED" sound name "Basso"' \
     -e 'end run' "$summary" >/dev/null 2>&1 && return 0
   log "wedge alarm: osascript notification failed"
@@ -739,7 +778,7 @@ wedge_alarm_via_herdr() {  # <summary>
   local summary=$1
   command -v herdr >/dev/null 2>&1 || {
     log "wedge alarm: herdr not found; cannot post a herdr notification"; return 1; }
-  herdr notification show "firstmate: away-mode escalations WEDGED" \
+  wedge_alarm_run_bounded herdr herdr notification show "firstmate: away-mode escalations WEDGED" \
     --body "$summary" --sound request >/dev/null 2>&1 && return 0
   log "wedge alarm: herdr notification failed"
   return 1
@@ -751,7 +790,8 @@ wedge_alarm_via_herdr() {  # <summary>
 wedge_alarm_via_command() {  # <cmd> <summary>
   local cmd=$1 summary=$2 rc
   [ -n "$cmd" ] || { log "wedge alarm: empty command: channel; nothing to run"; return 1; }
-  printf '%s\n' "$summary" | sh -c "$cmd" fm-wedge-alarm "$summary" >/dev/null 2>&1
+  wedge_alarm_run_bounded command sh -c "$cmd" fm-wedge-alarm "$summary" \
+    <<< "$summary" >/dev/null 2>&1
   rc=$?
   [ "$rc" -eq 0 ] && return 0
   log "wedge alarm: command channel exited $rc: $cmd"
@@ -775,7 +815,7 @@ wedge_alarm_emit() {  # <channel> <summary>
     '') : ;;                      # production: fall through to the real notifier
     discard) return 0 ;;          # library/test default: fire nothing
     *)
-      "$exec_override" "$channel" "$summary" >/dev/null 2>&1
+      wedge_alarm_run_bounded "$channel" "$exec_override" "$channel" "$summary" >/dev/null 2>&1
       rc=$?
       [ "$rc" -eq 0 ] && return 0
       log "wedge alarm: notifier override exited $rc for channel '$channel'"
