@@ -154,7 +154,10 @@ printf '%s' "$SNAPSHOT" | jq -r \
     def detail_of($t): ($t.current_state.detail // "");
     def is_ask_user($t): detail_of($t) | test("ask-user");
     def is_merged($t): detail_of($t) | test("merged|PR merged/closed");
-    def repo_of($t): ($t.backlog.repo // $t.project) | if . == null or . == "" then "-" else . end;
+    def repo_of($t):
+      ($t.backlog.repo
+       // ($t.project | if . == null or . == "" then null else (split("/") | last) end))
+      | if . == null or . == "" then "-" else . end;
     def headline($t):
       detail_of($t) as $d
       | if $d != "" then $d
@@ -170,6 +173,7 @@ printf '%s' "$SNAPSHOT" | jq -r \
         elif $s == "parked" then "needs-decision"
         elif $s == "done" then
           (if is_merged($t) then "done"
+           elif $t.kind == "scout" then "done"
            elif ($t.pr.url != null) then "ready"
            elif ($t.mode == "local-only") then "ready"
            else "done" end)

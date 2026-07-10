@@ -106,12 +106,12 @@ test_section_bucketing_by_owner() {
   # NEEDS YOU: a captain decision (idle pane keeps the needs-decision current).
   fm_write_meta "$home/state/dec-task.meta" \
     "window=firstmate:fm-dec-task" "worktree=$home/projects/dec" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'needs-decision: REST or GraphQL\n' > "$home/state/dec-task.status"
   # NEEDS YOU: a PR ready to merge.
   fm_write_meta "$home/state/pr-task.meta" \
     "window=firstmate:fm-pr-task" "worktree=$home/projects/pr" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off" \
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
     "pr=https://github.com/kunchenguid/firstmate/pull/99"
   printf 'done: PR https://github.com/kunchenguid/firstmate/pull/99 checks green\n' > "$home/state/pr-task.status"
   # NEEDS YOU: a local-only branch ready for review + approval.
@@ -119,31 +119,33 @@ test_section_bucketing_by_owner() {
     "window=firstmate:fm-local-task" "worktree=$home/projects/local" \
     "project=beta" "harness=codex" "kind=ship" "mode=local-only" "yolo=off"
   printf 'done: ready in branch fm/local-task\n' > "$home/state/local-task.status"
-  # NEEDS YOU: a scout report ready for the captain.
+  # NEEDS YOU: a scout report ready for the captain. mode=local-only is a real
+  # delivery mode fm-spawn records (a scout inherits its project's mode); it must
+  # still route to the report, never to the local-only "review diff, then approve".
   fm_write_meta "$home/state/scout-task.meta" \
     "window=firstmate:fm-scout-task" "worktree=$home/projects/scout" \
-    "project=alpha" "harness=codex" "kind=scout" "mode=scout" "yolo=off"
+    "project=alpha" "harness=codex" "kind=scout" "mode=local-only" "yolo=off"
   printf 'done: report ready\n' > "$home/state/scout-task.status"
   printf '# findings\n' > "$home/data/scout-task/report.md"
   # AT RISK: a failed run.
   fm_write_meta "$home/state/broke-task.meta" \
     "window=firstmate:fm-broke-task" "worktree=$home/projects/broke" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'failed: build will not compile\n' > "$home/state/broke-task.status"
   # AT RISK: a genuinely blocked crew.
   fm_write_meta "$home/state/block-task.meta" \
     "window=firstmate:fm-block-task" "worktree=$home/projects/block" \
-    "project=beta" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=beta" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'blocked: waiting on prod credentials\n' > "$home/state/block-task.status"
   # RUNNING: a crew actively coding (busy pane).
   fm_write_meta "$home/state/coding-task.meta" \
     "window=firstmate:fm-coding-busy" "worktree=$home/projects/coding-busy" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'working: implementing the endpoint\n' > "$home/state/coding-task.status"
   # RUNNING: a declared external wait.
   fm_write_meta "$home/state/pause-task.meta" \
     "window=firstmate:fm-pause-task" "worktree=$home/projects/pause" \
-    "project=gamma" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=gamma" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'paused: waiting on upstream release cut\n' > "$home/state/pause-task.status"
 
   fakebin=$(make_fakebin "$home")
@@ -162,7 +164,7 @@ test_section_bucketing_by_owner() {
     (row("dec-task")   | .phase == "needs-decision" and .owner == "captain" and .reply_syntax == "dec-task: <your decision>")
       and (row("pr-task")    | .phase == "ready" and .owner == "captain" and .reply_syntax == "https://github.com/kunchenguid/firstmate/pull/99")
       and (row("local-task") | .phase == "ready" and .owner == "captain" and .reply_syntax == "local-task: approve")
-      and (row("scout-task") | .owner == "captain" and (.reply_syntax | endswith("scout-task/report.md")))
+      and (row("scout-task") | .phase == "done" and .owner == "captain" and .next_action == "findings ready - read report" and (.reply_syntax | endswith("scout-task/report.md")))
       and (row("broke-task") | .phase == "failed" and .owner == "firstmate")
       and (row("block-task") | .phase == "blocked" and .owner == "firstmate")
       and (row("coding-task")| .phase == "working" and .owner == "crew" and .health == "active")
@@ -187,13 +189,13 @@ test_reconcile_over_stale_status_log() {
   # Idle pane: the needs-decision log line IS the current state -> NEEDS YOU.
   fm_write_meta "$home/state/pending-task.meta" \
     "window=firstmate:fm-pending-task" "worktree=$home/projects/pending" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'needs-decision: still open\n' > "$home/state/pending-task.status"
   # Busy pane: the same needs-decision log line is STALE; the gate resolved and
   # the crew resumed. Current state is working, so it must NOT land in NEEDS YOU.
   fm_write_meta "$home/state/resumed-task.meta" \
     "window=firstmate:fm-resumed-busy" "worktree=$home/projects/resumed-busy" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'needs-decision: already answered and resumed\n' > "$home/state/resumed-task.status"
 
   fakebin=$(make_fakebin "$home")
@@ -220,7 +222,7 @@ test_graceful_unresolvable_task() {
   # never guess, and must still exit 0.
   fm_write_meta "$home/state/ghost-task.meta" \
     "window=firstmate:fm-ghost-task" "worktree=$home/projects/gone" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'working: was mid task before the worktree vanished\n' > "$home/state/ghost-task.status"
   fakebin=$(make_fakebin "$home")
   out=$(run_json "$home" "$fakebin") || fail "unresolvable --json must exit 0"
@@ -240,7 +242,7 @@ test_section_filter() {
   mkdir -p "$home/projects/dec"
   fm_write_meta "$home/state/dec-task.meta" \
     "window=firstmate:fm-dec-task" "worktree=$home/projects/dec" \
-    "project=alpha" "harness=codex" "kind=ship" "mode=ship" "yolo=off"
+    "project=alpha" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
   printf 'needs-decision: pick one\n' > "$home/state/dec-task.status"
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_FLEET_STATUS_NOW="$NOW" "$STATUS" --json --section needs-you) \
@@ -252,8 +254,29 @@ test_section_filter() {
   pass "--section filters the projection and rejects unknown names"
 }
 
+test_repo_normalizes_project_path() {
+  local home fakebin out
+  home=$(make_home reponorm)
+  mkdir -p "$home/projects/myrepo"
+  # No backlog record, so repo_of falls back to the meta project value, which
+  # fm-spawn records as an ABSOLUTE path. The JSON repo field must be the short
+  # basename, consistent with done_records' short repo names, not a full path.
+  fm_write_meta "$home/state/norepo-task.meta" \
+    "window=firstmate:fm-norepo-task" "worktree=$home/projects/myrepo" \
+    "project=$home/projects/myrepo" "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off"
+  printf 'working: implementing\n' > "$home/state/norepo-task.status"
+  fakebin=$(make_fakebin "$home")
+  out=$(run_json "$home" "$fakebin") || fail "repo-normalize --json must exit 0"
+  printf '%s' "$out" | jq -e '
+    def row($id): (.sections.needs_you + .sections.at_risk + .sections.running)[] | select(.id == $id);
+    (row("norepo-task") | .repo == "myrepo")
+  ' >/dev/null || fail "repo must normalize an absolute project path to its basename: $out"
+  pass "repo normalizes an absolute project path to its short basename"
+}
+
 test_empty_fleet
 test_section_bucketing_by_owner
 test_reconcile_over_stale_status_log
 test_graceful_unresolvable_task
 test_section_filter
+test_repo_normalizes_project_path
