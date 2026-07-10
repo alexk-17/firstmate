@@ -1133,6 +1133,27 @@ test_wedge_alarm_library_mode_defaults_to_discard() {
   pass "library mode: sourcing the daemon defaults FM_WEDGE_ALARM_EXEC to discard (no test can fire a real notification)"
 }
 
+test_wake_helpers_replace_inherited_notifier_override() {
+  local dir unsafe_log alert_log unsafe
+  dir=$(make_wedge_case wedge-inherited-override)
+  unsafe_log="$dir/unsafe.log"
+  alert_log="$dir/alert.log"
+  unsafe="$dir/unsafe-override"
+  cat > "$unsafe" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' invoked >> "${FM_WEDGE_ALARM_UNSAFE_LOG:?}"
+SH
+  chmod +x "$unsafe"
+  FM_WEDGE_ALARM_EXEC="$unsafe" FM_WEDGE_ALARM_UNSAFE_LOG="$unsafe_log" \
+    FM_WEDGE_ALARM_LOG="$alert_log" FM_WEDGE_ALARM_CHANNEL=osascript \
+    bash -c '. "$1"; . "$2"; wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"' \
+      _ "$ROOT/tests/wake-helpers.sh" "$DAEMON"
+  [ ! -s "$unsafe_log" ] || fail "wake helpers preserved an inherited notifier override"
+  grep -F 'osascript' "$alert_log" >/dev/null \
+    || fail "wake helpers did not install the safe notifier recorder"
+  pass "wake helpers replace inherited notifier overrides with the safe recorder"
+}
+
 test_wedge_alarm_discard_seam_fires_nothing() {
   local dir log
   dir=$(make_wedge_case wedge-discard); log="$dir/alert.log"
@@ -1606,6 +1627,7 @@ test_normal_flush_clears_stale_wedge_marker
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard
+test_wake_helpers_replace_inherited_notifier_override
 test_wedge_alarm_discard_seam_fires_nothing
 test_wedge_alarm_direct_notifiers_honor_discard_seam
 test_wedge_alarm_osascript_channel_selected
