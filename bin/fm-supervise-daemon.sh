@@ -46,7 +46,8 @@
 #     healthy crewmate's own progress.
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
 #     undelivered past FM_MAX_DEFER_SECS, the daemon retries a normal flush and
-#     writes state/.subsuper-inject-wedged if submit still cannot be confirmed.
+#     writes state/.subsuper-inject-wedged and attempts a configurable active
+#     alert if submit still cannot be confirmed.
 #   - Cheap heartbeat catch-all: every HEARTBEAT_SCAN_SECS the daemon greps all
 #     state/*.status for a captain-relevant line the per-wake classifier might
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
@@ -672,7 +673,7 @@ escalate_flush() {  # <state>
 # (the 2026-07-10 overnight incident: a claude-on-herdr primary) got NO active
 # signal - only the passive state/.subsuper-inject-wedged marker, which nothing
 # surfaces until the next fleet action (that night, 20 escalations sat buffered
-# for 8.5h). These helpers add a config-gated active alert that does not depend
+# for 8.5h). These helpers add a configurable active alert that does not depend
 # on any pane or its backend status-line: an OS-level macOS notification, a
 # herdr notification, or a captain-supplied command (push to a phone, etc.).
 # Every channel is best-effort - a missing or failing channel logs and is
@@ -900,8 +901,9 @@ wedge_alarm_notify() {  # <summary> <marker>
 # max-defer (the supervisor pane is genuinely busy/wedged, or the submit's Enter
 # is swallowed). The daemon must NEVER silently wedge: this logs
 # an ERROR, drops a durable marker firstmate/recovery can surface, flashes
-# the supervisor client's status line, and fires a backend-independent active
-# alert (wedge_alarm_notify). Nothing is lost - the buffer and the
+# the tmux supervisor client's status line when applicable, and attempts a
+# configurable backend-independent active alert (wedge_alarm_notify). Nothing
+# is lost - the buffer and the
 # wake-queue both survive - but the stall stops being invisible.
 inject_wedge_alarm() {  # <state> <age-seconds>
   local state=$1 age=$2 marker target backend max_defer now notify=1
@@ -933,9 +935,9 @@ inject_wedge_alarm() {  # <state> <age-seconds>
     tmux display-message -t "$target" "fm: away-mode escalations WEDGED ${age}s — see $marker" 2>/dev/null || true
   fi
   # Backend-independent active alert. Unlike the tmux flash above (skipped on
-  # every non-tmux backend), this reaches the captain even when every pane and
+  # every non-tmux backend), this can reach the captain even when every pane and
   # its backend status-line is unreadable - the gap the 2026-07-10 overnight
-  # incident fell through. Config-gated and best-effort; the marker above stays
+  # incident fell through. Configurable and best-effort; the marker above stays
   # the durable record whether or not any channel fires.
   if [ "$notify" -eq 1 ]; then
     wedge_alarm_notify "away-mode escalations WEDGED ${age}s undelivered - see $marker" "$marker"

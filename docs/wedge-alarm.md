@@ -11,12 +11,12 @@ On 2026-07-10 a `claude`-on-`herdr` primary wedged past max-defer overnight: the
 Nothing surfaces that marker until the next fleet action, so 20 escalations sat buffered for roughly 8.5 hours with no active alert.
 The classifier-side half of that incident shipped separately (PR #429); this is the alarm-channel half.
 
-`inject_wedge_alarm` now also calls `wedge_alarm_notify`, a config-gated active alert that does not depend on any pane or its backend status-line.
+`inject_wedge_alarm` now also calls `wedge_alarm_notify`, a configurable active alert that does not depend on any pane or its backend status-line.
 The durable marker and the tmux flash are unchanged; the active alert is added alongside them.
 
 ## Channels
 
-`config/wedge-alarm` (local, gitignored) lists channel directives, one per non-empty, non-comment line; every listed channel fires, best-effort.
+`config/wedge-alarm` (local, gitignored) lists channel directives, one per non-empty, non-comment line; every listed non-`off` channel fires, best-effort.
 `FM_WEDGE_ALARM_CHANNEL` overrides the file with a single directive (used by the tests).
 
 - `off` - position-independent kill switch that disables every active alert; the marker and tmux flash remain.
@@ -53,7 +53,7 @@ The real `osascript`/`herdr` invocation form is verified once by the single boun
 
 Recorded 2026-07-10T12:41-0700 on macOS 26.5.2 (build 25F84), `osascript` at `/usr/bin/osascript`, `herdr` 0.7.3.
 This is the single bounded manual verification (two invocations, one per OS channel), labelled "FIRSTMATE TEST - IGNORE" so the banners are unmistakably harmless.
-It is the only place a real notification is ever fired; it is never run inside a test suite.
+These are the only verification commands that fire real notifications, and they are never run inside a test suite.
 
 ### osascript channel (the exact argv-safe form the daemon runs)
 
