@@ -19,7 +19,7 @@ The durable marker and the tmux flash are unchanged; the active alert is added a
 `config/wedge-alarm` (local, gitignored) lists channel directives, one per non-empty, non-comment line; every listed channel fires, best-effort.
 `FM_WEDGE_ALARM_CHANNEL` overrides the file with a single directive (used by the tests).
 
-- `off` - disable the active alert entirely; the marker and tmux flash remain.
+- `off` - position-independent kill switch that disables every active alert; the marker and tmux flash remain.
 - `auto` / `default` - platform default. macOS resolves to `osascript`; other platforms have no built-in OS channel, so `auto` there fires nothing and logs that the durable marker is the only signal (configure a `command:` directive instead).
 - `osascript` - a macOS Notification Center banner via `osascript`. OS-level, so it reaches the captain even when every pane and its status-line is unreadable.
 - `herdr` - a herdr UI notification via `herdr notification show`. herdr's own surface, separate from the pane and its status-line.
@@ -31,14 +31,13 @@ The alarm is rate-limited to at most once per max-defer window, and fires only a
 
 Each channel is best-effort: a missing binary or a non-zero exit logs a warning and the alarm falls through to the next channel, never crashing the daemon loop.
 Every invocation is also process-group bounded by `FM_WEDGE_ALARM_TIMEOUT_SECS` (10 seconds by default), including `command:`, `osascript`, `herdr`, and an `FM_WEDGE_ALARM_EXEC` override.
-On timeout its watchdog terminates the notifier, logs the timeout, and continues to the next configured channel.
+On timeout or daemon shutdown, its watchdog terminates the notifier group, logs the timeout when applicable, and continues to the next configured channel.
 The AppleScript passes the summary as an `argv` item rather than interpolating it into the script source, so summary text can never break the notification.
 See `docs/examples/wedge-alarm` for a copyable starting config.
 
 ## Test safety: no test posts a real notification
 
-The OS notifier channels (`osascript`, `herdr`) never run their real binary directly.
-They route through a single seam, `FM_WEDGE_ALARM_EXEC`: when it is set, the daemon hands the resolved channel name and summary to that command instead of the real notifier (`wedge_alarm_emit` in `bin/fm-supervise-daemon.sh`).
+Every notifier channel (`osascript`, `herdr`, and `command:`) routes through a single seam, `FM_WEDGE_ALARM_EXEC`: when it is set, the daemon hands the fixed channel category and summary to that command instead of the real notifier (`wedge_alarm_emit` in `bin/fm-supervise-daemon.sh`).
 This makes it structurally impossible for a test to post a real desktop notification, and impossible for a future test author to forget to stub:
 
 - The daemon is only ever sourced (not executed) by tests - production `bin/fm-afk-start.sh` execs it.
@@ -85,4 +84,4 @@ The daemon redirects this stdout to `/dev/null` and treats a zero exit as succes
 ### command channel dispatch (summary on $1 and stdin)
 
 The `command:` channel runs `sh -c "<cmd>" fm-wedge-alarm "<summary>"` with the summary also piped on stdin.
-This dispatch contract is verified automatically by `test_wedge_alarm_command_channel_receives_summary` (a safe file-writing command, no notification), so it needs no manual real-notifier run.
+`test_wedge_alarm_command_channel_receives_summary` deliberately unsets the seam for a safe file-writing command to verify this dispatch contract without a notification.

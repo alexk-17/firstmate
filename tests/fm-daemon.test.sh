@@ -1088,7 +1088,7 @@ test_max_defer_afk_inactive_does_not_flush_or_alarm() {
 # ACTIVE alert channel must reach the captain even when the wedged pane and its
 # backend status-line are unreadable (a claude-on-herdr primary that night).
 #
-# NO test here EVER posts a real notification. Every OS notifier routes through
+# NO test here EVER posts a real notification. Every notifier routes through
 # the FM_WEDGE_ALARM_EXEC seam, which tests/wake-helpers.sh forces to a recorder
 # ($FM_WEDGE_ALARM_LOG logs "<channel>\t<summary>"); the daemon also defaults
 # that seam to "discard" whenever it is sourced. Assertions read the recorder
@@ -1155,24 +1155,31 @@ SH
 }
 
 test_wedge_alarm_discard_seam_fires_nothing() {
-  local dir log
+  local dir log command_output channel
   dir=$(make_wedge_case wedge-discard); log="$dir/alert.log"
+  command_output="$dir/command-output"
+  channel="command: printf '%s' \"\$1\" > '$command_output'"
   PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_EXEC=discard \
-    FM_WEDGE_ALARM_CHANNEL=$'osascript\nherdr' \
+    FM_WEDGE_ALARM_CHANNEL=$'osascript\nherdr\n'"$channel" \
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
-  [ ! -s "$log" ] || fail "the discard seam still fired an OS notifier: $(cat "$log")"
-  pass "the discard seam suppresses every OS notifier (fires nothing)"
+  [ ! -s "$log" ] || fail "the discard seam still fired a notifier: $(cat "$log")"
+  [ ! -e "$command_output" ] || fail "the discard seam still fired a command: notifier"
+  pass "the discard seam suppresses every notifier, including command: (fires nothing)"
 }
 
 test_wedge_alarm_direct_notifiers_honor_discard_seam() {
-  local dir real_log
+  local dir real_log command_output command
   dir=$(make_wedge_case wedge-direct-discard); real_log="$dir/real.log"
+  command_output="$dir/command-output"
+  command="printf '%s' \"\$1\" > '$command_output'"
   PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_REAL_LOG="$real_log" FM_WEDGE_ALARM_EXEC=discard \
     wedge_alarm_via_osascript "away-mode WEDGED 900s"
   PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_REAL_LOG="$real_log" FM_WEDGE_ALARM_EXEC=discard \
     wedge_alarm_via_herdr "away-mode WEDGED 900s"
-  [ ! -s "$real_log" ] || fail "direct OS notifier helpers bypassed the discard seam: $(cat "$real_log")"
-  pass "direct OS notifier helpers honor the discard seam"
+  FM_WEDGE_ALARM_EXEC=discard wedge_alarm_via_command "$command" "away-mode WEDGED 900s"
+  [ ! -s "$real_log" ] || fail "direct notifier helpers bypassed the discard seam: $(cat "$real_log")"
+  [ ! -e "$command_output" ] || fail "direct command helper bypassed the discard seam"
+  pass "direct notifier helpers honor the discard seam, including command:"
 }
 
 test_wedge_alarm_osascript_channel_selected() {
@@ -1198,13 +1205,11 @@ test_wedge_alarm_herdr_channel_selected() {
 }
 
 test_wedge_alarm_command_channel_receives_summary() {
-  # The command: channel is captain-supplied and runs directly (not through the
-  # notifier seam), so this verifies its $1 + stdin contract with a safe writer.
   local dir out_argv out_stdin chan
   dir=$(make_wedge_case wedge-command)
   out_argv="$dir/argv.txt"; out_stdin="$dir/stdin.txt"
   chan="command: printf '%s' \"\$1\" > '$out_argv'; cat > '$out_stdin'"
-  FM_WEDGE_ALARM_CHANNEL="$chan" \
+  FM_WEDGE_ALARM_EXEC='' FM_WEDGE_ALARM_CHANNEL="$chan" \
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
   [ "$(cat "$out_argv" 2>/dev/null)" = "away-mode WEDGED 900s" ] || fail "command channel did not receive the summary on \$1"
   grep -F 'away-mode WEDGED 900s' "$out_stdin" >/dev/null || fail "command channel did not receive the summary on stdin"
@@ -1215,7 +1220,7 @@ test_wedge_alarm_command_failure_hides_configured_command() {
   local dir daemon_log secret rc
   dir=$(make_wedge_case wedge-command-redaction); daemon_log="$dir/daemon.log"
   secret="https://alerts.example.invalid/hook?token=private-wedge-token"
-  LOG="$daemon_log" FM_WEDGE_ALARM_CHANNEL="command:exit 73 # $secret" \
+  LOG="$daemon_log" FM_WEDGE_ALARM_EXEC='' FM_WEDGE_ALARM_CHANNEL="command:exit 73 # $secret" \
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
   rc=$?
   [ "$rc" -eq 0 ] || fail "a failed command channel made wedge_alarm_notify return non-zero ($rc)"
@@ -1241,13 +1246,16 @@ test_wedge_alarm_unknown_channel_hides_configured_directive() {
   pass "unknown channel directives are redacted while the alarm keeps running"
 }
 
-test_wedge_alarm_off_disables_active_alert() {
-  local dir log
+test_wedge_alarm_off_disables_active_alert_regardless_of_position() {
+  local dir log directives
   dir=$(make_wedge_case wedge-off); log="$dir/alert.log"
-  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=off \
-    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
-  [ ! -s "$log" ] || fail "off channel still selected an active alert: $(cat "$log")"
-  pass "off disables the active alert entirely (durable marker and tmux flash are unaffected)"
+  for directives in $'osascript\noff' $'off\nosascript'; do
+    : > "$log"
+    FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL="$directives" \
+      wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+    [ ! -s "$log" ] || fail "off did not disable a preceding or following active alert: $(cat "$log")"
+  done
+  pass "off disables every active alert regardless of directive position (marker and tmux flash are unaffected)"
 }
 
 test_wedge_alarm_auto_darwin_selects_osascript() {
@@ -1294,42 +1302,61 @@ test_wedge_alarm_failing_channel_degrades_gracefully() {
 }
 
 test_wedge_alarm_hung_channel_times_out_and_falls_through() {
-  local dir log daemon_log start elapsed
-  dir=$(make_wedge_case wedge-timeout); log="$dir/alert.log"; daemon_log="$dir/daemon.log"
+  local dir daemon_log output channel start elapsed
+  dir=$(make_wedge_case wedge-timeout); daemon_log="$dir/daemon.log"; output="$dir/fallback-output"
+  channel="command: printf '%s' \"\$1\" > '$output'"
   start=$SECONDS
-  LOG="$daemon_log" FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_TIMEOUT_SECS=1 \
-    FM_WEDGE_ALARM_CHANNEL=$'command:sleep 30\nosascript' \
+  LOG="$daemon_log" FM_WEDGE_ALARM_EXEC='' FM_WEDGE_ALARM_TIMEOUT_SECS=1 \
+    FM_WEDGE_ALARM_CHANNEL=$'command:sleep 30\n'"$channel" \
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
   elapsed=$((SECONDS - start))
   [ "$elapsed" -lt 5 ] || fail "a hung wedge notifier blocked the alarm for ${elapsed}s"
   grep -F 'command notifier timed out' "$daemon_log" >/dev/null \
     || fail "a hung wedge notifier did not log its timeout: $(cat "$daemon_log" 2>/dev/null)"
-  grep -F 'osascript' "$log" >/dev/null \
-    || fail "a timed-out command notifier prevented the next channel: $(cat "$log")"
+  [ "$(cat "$output" 2>/dev/null)" = "away-mode WEDGED 900s" ] \
+    || fail "a timed-out command notifier prevented the next channel"
   pass "a hung notifier is bounded, logged, and falls through to the next channel"
 }
 
 test_wedge_alarm_hung_override_times_out_and_falls_through() {
-  local dir blocker out daemon_log channel start elapsed
+  local dir blocker daemon_log start elapsed
   dir=$(make_wedge_case wedge-override-timeout)
-  blocker="$dir/blocker"; out="$dir/override-fallback"; daemon_log="$dir/daemon.log"
+  blocker="$dir/blocker"; daemon_log="$dir/daemon.log"
   cat > "$blocker" <<'SH'
 #!/usr/bin/env bash
 sleep 30
 SH
   chmod +x "$blocker"
-  channel="command: printf '%s' \"\$1\" > '$out'"
   start=$SECONDS
   LOG="$daemon_log" FM_WEDGE_ALARM_EXEC="$blocker" FM_WEDGE_ALARM_TIMEOUT_SECS=1 \
-    FM_WEDGE_ALARM_CHANNEL=$'osascript\n'"$channel" \
+    FM_WEDGE_ALARM_CHANNEL=$'osascript\nherdr' \
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
   elapsed=$((SECONDS - start))
-  [ "$elapsed" -lt 5 ] || fail "a hung wedge notifier override blocked the alarm for ${elapsed}s"
+  [ "$elapsed" -lt 6 ] || fail "a hung wedge notifier override blocked the alarm for ${elapsed}s"
   grep -F 'osascript notifier timed out' "$daemon_log" >/dev/null \
     || fail "a hung notifier override did not log its timeout: $(cat "$daemon_log" 2>/dev/null)"
-  [ "$(cat "$out" 2>/dev/null)" = "away-mode WEDGED 900s" ] \
-    || fail "a timed-out notifier override prevented the next channel"
-  pass "a hung notifier override is bounded, logged, and falls through to the next channel"
+  grep -F 'herdr notifier timed out' "$daemon_log" >/dev/null \
+    || fail "a hung notifier override prevented the next channel: $(cat "$daemon_log" 2>/dev/null)"
+  pass "a hung notifier override is bounded, logged, and proceeds to the next channel"
+}
+
+test_wedge_alarm_shutdown_stops_active_notifier_group() {
+  local dir child_file pid child
+  dir=$(make_wedge_case wedge-shutdown)
+  child_file="$dir/notifier-child"
+  (
+    set -m
+    sh -c 'sleep 30 & printf "%s" "$!" > "$1"; wait' sh "$child_file" &
+    pid=$!
+    while [ ! -s "$child_file" ]; do sleep 0.05; done
+    child=$(cat "$child_file")
+    WEDGE_ALARM_NOTIFIER_PID=$pid
+    wedge_alarm_stop_active_notifier
+    if kill -0 "$child" 2>/dev/null; then
+      fail "shutdown left a notifier descendant running (pid $child)"
+    fi
+  ) || fail "notifier shutdown cleanup helper failed"
+  pass "daemon shutdown stops and reaps the active notifier process group"
 }
 
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend() {
@@ -1673,13 +1700,14 @@ test_wedge_alarm_herdr_channel_selected
 test_wedge_alarm_command_channel_receives_summary
 test_wedge_alarm_command_failure_hides_configured_command
 test_wedge_alarm_unknown_channel_hides_configured_directive
-test_wedge_alarm_off_disables_active_alert
+test_wedge_alarm_off_disables_active_alert_regardless_of_position
 test_wedge_alarm_auto_darwin_selects_osascript
 test_wedge_alarm_auto_non_darwin_has_no_os_channel
 test_wedge_alarm_config_file_multi_channel
 test_wedge_alarm_failing_channel_degrades_gracefully
 test_wedge_alarm_hung_channel_times_out_and_falls_through
 test_wedge_alarm_hung_override_times_out_and_falls_through
+test_wedge_alarm_shutdown_stops_active_notifier_group
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend
 test_inject_wedge_alarm_throttles_when_marker_cannot_be_written
 test_fm_send_exits_nonzero_on_confirmed_swallow

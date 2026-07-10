@@ -4,8 +4,8 @@
 # non-empty, non-comment line; every listed channel fires, best-effort.
 #
 # Directives:
-#   off              disable the active alert entirely (the durable marker and
-#                    the tmux status-line flash still fire)
+#   off              position-independent kill switch: disable every active
+#                    alert (the durable marker and tmux status-line flash remain)
 #   auto | default   platform default: macOS -> osascript; other platforms have
 #                    no built-in OS channel (configure a command: line instead)
 #   osascript        macOS Notification Center banner (backend-independent)
