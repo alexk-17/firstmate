@@ -1324,6 +1324,7 @@ test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend() {
   local dir state log
   dir=$(make_wedge_case wedge-integration); state="$dir/state"; log="$dir/alert.log"
   escalate_add "$state" "needs-decision: pick A"
+  WEDGE_ALARM_LAST_EPOCH=0
   FM_WEDGE_ALARM_LOG="$log" FM_STATE_OVERRIDE="$state" \
     FM_WEDGE_ALARM_CHANNEL=osascript FM_SUPERVISOR_BACKEND=herdr \
     inject_wedge_alarm "$state" 30600
@@ -1331,6 +1332,28 @@ test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend() {
   grep -F 'osascript' "$log" >/dev/null || fail "inject_wedge_alarm did not emit the active alert on a non-tmux backend: $(cat "$log")"
   grep -F 'WEDGED 30600s' "$log" >/dev/null || fail "active alert missing the age and summary"
   pass "inject_wedge_alarm writes the marker AND emits the active alert even with no tmux status-line (herdr backend)"
+}
+
+test_inject_wedge_alarm_throttles_when_marker_cannot_be_written() {
+  local dir state log daemon_log alerts errors
+  dir=$(make_wedge_case wedge-unwritable-marker)
+  state="$dir/state"; log="$dir/alert.log"; daemon_log="$dir/daemon.log"
+  escalate_add "$state" "needs-decision: pick A"
+  chmod u-w "$state"
+  WEDGE_ALARM_LAST_EPOCH=0
+  LOG="$daemon_log" FM_WEDGE_ALARM_LOG="$log" FM_MAX_DEFER_SECS=600 \
+    FM_WEDGE_ALARM_CHANNEL=osascript FM_SUPERVISOR_BACKEND=herdr \
+    inject_wedge_alarm "$state" 30600
+  LOG="$daemon_log" FM_WEDGE_ALARM_LOG="$log" FM_MAX_DEFER_SECS=600 \
+    FM_WEDGE_ALARM_CHANNEL=osascript FM_SUPERVISOR_BACKEND=herdr \
+    inject_wedge_alarm "$state" 30615
+  chmod u+w "$state"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "wedge marker unexpectedly persisted in an unwritable state directory"
+  alerts=$(grep -c 'osascript' "$log" 2>/dev/null || true)
+  [ "$alerts" -eq 1 ] || fail "unwritable marker emitted $alerts active alerts instead of one"
+  errors=$(grep -c 'ERROR: away-mode escalation undelivered' "$daemon_log" 2>/dev/null || true)
+  [ "$errors" -eq 1 ] || fail "unwritable marker logged $errors wedge errors instead of one"
+  pass "in-process wedge throttle prevents alert spam when the marker cannot persist"
 }
 
 test_fm_send_exits_nonzero_on_confirmed_swallow() {
@@ -1642,6 +1665,7 @@ test_wedge_alarm_failing_channel_degrades_gracefully
 test_wedge_alarm_hung_channel_times_out_and_falls_through
 test_wedge_alarm_hung_override_times_out_and_falls_through
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend
+test_inject_wedge_alarm_throttles_when_marker_cannot_be_written
 test_fm_send_exits_nonzero_on_confirmed_swallow
 test_fm_send_exits_nonzero_on_initial_send_failure
 test_discover_supervisor_backend_precedence
