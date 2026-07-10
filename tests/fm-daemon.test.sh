@@ -1083,6 +1083,166 @@ test_max_defer_afk_inactive_does_not_flush_or_alarm() {
   pass "max-defer does not flush or alarm while afk is inactive"
 }
 
+# --- backend-independent active wedge alert ---------------------------------
+# These cover the 2026-07-10 overnight-incident fix: the max-defer wedge alarm's
+# ACTIVE alert channel must reach the captain even when the wedged pane and its
+# backend status-line are unreadable (a claude-on-herdr primary that night).
+#
+# NO test here EVER posts a real notification. Every OS notifier routes through
+# the FM_WEDGE_ALARM_EXEC seam, which tests/wake-helpers.sh forces to a recorder
+# ($FM_WEDGE_ALARM_LOG logs "<channel>\t<summary>"); the daemon also defaults
+# that seam to "discard" whenever it is sourced. Assertions read the recorder
+# log, so they verify channel SELECTION and summary propagation; the real
+# osascript/herdr argv is verified once by the bounded manual evidence in
+# docs/wedge-alarm.md, never from a suite.
+make_wedge_case() {  # <name> -> echoes dir; creates state/, fakebin/{uname,osascript}, alert.log
+  local name=$1 dir fakebin
+  dir="$TMP_ROOT/$name"; fakebin="$dir/fakebin"
+  mkdir -p "$dir/state" "$fakebin"
+  # Fake uname so `auto` platform resolution is deterministic on any CI host.
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${FM_FAKE_UNAME:-Darwin}"
+SH
+  # No-op osascript so wedge_alarm_platform_default's `command -v osascript`
+  # presence check passes on non-macOS CI. NEVER executed: the recorder seam
+  # intercepts every OS notifier before any real binary could run.
+  cat > "$fakebin/osascript" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fakebin/uname" "$fakebin/osascript"
+  : > "$dir/alert.log"
+  printf '%s\n' "$dir"
+}
+
+test_wedge_alarm_library_mode_defaults_to_discard() {
+  # The structural guarantee: sourcing the daemon with NO seam configured defaults
+  # FM_WEDGE_ALARM_EXEC to "discard", so a sourced context (every test) cannot
+  # fire a real notification even if it forgets to stub. Checked in a clean
+  # subshell that first unsets this harness's recorder.
+  local out
+  # shellcheck disable=SC2016  # $1/$FM_WEDGE_ALARM_EXEC must expand in the child, not here
+  out=$(env -u FM_WEDGE_ALARM_EXEC bash -c '. "$1"; printf "%s" "${FM_WEDGE_ALARM_EXEC:-UNSET}"' _ "$DAEMON")
+  [ "$out" = discard ] \
+    || fail "sourcing the daemon did not default the notifier seam to discard (got: $out)"
+  pass "library mode: sourcing the daemon defaults FM_WEDGE_ALARM_EXEC to discard (no test can fire a real notification)"
+}
+
+test_wedge_alarm_discard_seam_fires_nothing() {
+  local dir log
+  dir=$(make_wedge_case wedge-discard); log="$dir/alert.log"
+  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_EXEC=discard \
+    FM_WEDGE_ALARM_CHANNEL=$'osascript\nherdr' \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  [ ! -s "$log" ] || fail "the discard seam still fired an OS notifier: $(cat "$log")"
+  pass "the discard seam suppresses every OS notifier (fires nothing)"
+}
+
+test_wedge_alarm_osascript_channel_selected() {
+  local dir log
+  dir=$(make_wedge_case wedge-osascript); log="$dir/alert.log"
+  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript \
+    wedge_alarm_notify "away-mode escalations WEDGED 600s undelivered - see /s/.marker" "/s/.marker"
+  grep -F 'osascript' "$log" >/dev/null || fail "osascript channel not routed through the notifier seam: $(cat "$log")"
+  grep -F 'WEDGED 600s undelivered' "$log" >/dev/null || fail "osascript channel did not carry the summary"
+  grep -F 'herdr' "$log" >/dev/null && fail "osascript-only config also selected herdr"
+  pass "osascript channel routes through the notifier seam with the summary (never a real notification)"
+}
+
+test_wedge_alarm_herdr_channel_selected() {
+  local dir log
+  dir=$(make_wedge_case wedge-herdr); log="$dir/alert.log"
+  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=herdr \
+    wedge_alarm_notify "away-mode escalations WEDGED 800s undelivered - see /s/.marker" "/s/.marker"
+  grep -F 'herdr' "$log" >/dev/null || fail "herdr channel not routed through the notifier seam: $(cat "$log")"
+  grep -F 'WEDGED 800s undelivered' "$log" >/dev/null || fail "herdr channel did not carry the summary"
+  grep -F 'osascript' "$log" >/dev/null && fail "herdr-only config also selected osascript"
+  pass "herdr channel routes through the notifier seam with the summary (never a real notification)"
+}
+
+test_wedge_alarm_command_channel_receives_summary() {
+  # The command: channel is captain-supplied and runs directly (not through the
+  # notifier seam), so this verifies its $1 + stdin contract with a safe writer.
+  local dir out_argv out_stdin chan
+  dir=$(make_wedge_case wedge-command)
+  out_argv="$dir/argv.txt"; out_stdin="$dir/stdin.txt"
+  chan="command: printf '%s' \"\$1\" > '$out_argv'; cat > '$out_stdin'"
+  FM_WEDGE_ALARM_CHANNEL="$chan" \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  [ "$(cat "$out_argv" 2>/dev/null)" = "away-mode WEDGED 900s" ] || fail "command channel did not receive the summary on \$1"
+  grep -F 'away-mode WEDGED 900s' "$out_stdin" >/dev/null || fail "command channel did not receive the summary on stdin"
+  pass "command channel runs the captain command with the summary on \$1 and on stdin"
+}
+
+test_wedge_alarm_off_disables_active_alert() {
+  local dir log
+  dir=$(make_wedge_case wedge-off); log="$dir/alert.log"
+  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=off \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  [ ! -s "$log" ] || fail "off channel still selected an active alert: $(cat "$log")"
+  pass "off disables the active alert entirely (durable marker and tmux flash are unaffected)"
+}
+
+test_wedge_alarm_auto_darwin_selects_osascript() {
+  local dir log
+  dir=$(make_wedge_case wedge-auto-darwin); log="$dir/alert.log"
+  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_LOG="$log" FM_FAKE_UNAME=Darwin FM_WEDGE_ALARM_CHANNEL=auto \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  grep -F 'osascript' "$log" >/dev/null || fail "auto did not resolve to osascript on Darwin: $(cat "$log")"
+  pass "auto resolves to the macOS osascript notifier on Darwin (default-on)"
+}
+
+test_wedge_alarm_auto_non_darwin_has_no_os_channel() {
+  local dir log
+  dir=$(make_wedge_case wedge-auto-linux); log="$dir/alert.log"
+  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_LOG="$log" FM_FAKE_UNAME=Linux FM_WEDGE_ALARM_CHANNEL=auto \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  [ ! -s "$log" ] || fail "auto selected a built-in OS channel on a non-macOS platform: $(cat "$log")"
+  pass "auto on a non-macOS platform selects no built-in OS channel (the marker or a configured command carries it)"
+}
+
+test_wedge_alarm_config_file_multi_channel() {
+  local dir cfgdir log
+  dir=$(make_wedge_case wedge-config); log="$dir/alert.log"
+  cfgdir="$dir/config"; mkdir -p "$cfgdir"
+  printf '# active alert channels\n\nosascript\nherdr\n' > "$cfgdir/wedge-alarm"
+  FM_WEDGE_ALARM_LOG="$log" FM_CONFIG_OVERRIDE="$cfgdir" \
+    wedge_alarm_notify "away-mode WEDGED 700s" "/s/.marker"
+  grep -F 'osascript' "$log" >/dev/null || fail "config/wedge-alarm osascript line was not selected"
+  grep -F 'herdr' "$log" >/dev/null || fail "config/wedge-alarm herdr line was not selected"
+  pass "config/wedge-alarm selects every configured channel and skips comment and blank lines"
+}
+
+test_wedge_alarm_failing_channel_degrades_gracefully() {
+  local dir log rc
+  dir=$(make_wedge_case wedge-degrade); log="$dir/alert.log"
+  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_FAIL=osascript \
+    FM_WEDGE_ALARM_CHANNEL=$'osascript\nherdr' \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "a failing channel made wedge_alarm_notify return non-zero ($rc)"
+  grep -F 'osascript' "$log" >/dev/null || fail "the failing osascript channel was not even attempted"
+  grep -F 'herdr' "$log" >/dev/null || fail "a failing earlier channel prevented the herdr channel from firing"
+  pass "a failing channel logs and falls back to the next channel, never crashing the alarm"
+}
+
+test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend() {
+  # The whole incident: a non-tmux (herdr) primary gets NO tmux status-line
+  # flash, so inject_wedge_alarm must still emit the backend-independent alert
+  # alongside the durable marker.
+  local dir state log
+  dir=$(make_wedge_case wedge-integration); state="$dir/state"; log="$dir/alert.log"
+  escalate_add "$state" "needs-decision: pick A"
+  FM_WEDGE_ALARM_LOG="$log" FM_STATE_OVERRIDE="$state" \
+    FM_WEDGE_ALARM_CHANNEL=osascript FM_SUPERVISOR_BACKEND=herdr \
+    inject_wedge_alarm "$state" 30600
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "inject_wedge_alarm did not write the durable marker"
+  grep -F 'osascript' "$log" >/dev/null || fail "inject_wedge_alarm did not emit the active alert on a non-tmux backend: $(cat "$log")"
+  grep -F 'WEDGED 30600s' "$log" >/dev/null || fail "active alert missing the age and summary"
+  pass "inject_wedge_alarm writes the marker AND emits the active alert even with no tmux status-line (herdr backend)"
+}
+
 test_fm_send_exits_nonzero_on_confirmed_swallow() {
   # fm-send.sh must exit NON-ZERO when a steer's Enter is positively swallowed
   # (text left in the composer), so firstmate learns the instruction did not land
@@ -1376,6 +1536,17 @@ test_max_defer_pending_composer_alarms_without_typing
 test_normal_flush_clears_stale_wedge_marker
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
+test_wedge_alarm_library_mode_defaults_to_discard
+test_wedge_alarm_discard_seam_fires_nothing
+test_wedge_alarm_osascript_channel_selected
+test_wedge_alarm_herdr_channel_selected
+test_wedge_alarm_command_channel_receives_summary
+test_wedge_alarm_off_disables_active_alert
+test_wedge_alarm_auto_darwin_selects_osascript
+test_wedge_alarm_auto_non_darwin_has_no_os_channel
+test_wedge_alarm_config_file_multi_channel
+test_wedge_alarm_failing_channel_degrades_gracefully
+test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend
 test_fm_send_exits_nonzero_on_confirmed_swallow
 test_fm_send_exits_nonzero_on_initial_send_failure
 test_discover_supervisor_backend_precedence
