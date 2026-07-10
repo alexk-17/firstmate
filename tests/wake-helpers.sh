@@ -21,8 +21,8 @@ if [ -z "${FM_ROOT_OVERRIDE:-}" ]; then
 fi
 
 # Wedge-alarm notifier recorder (safety seam). The away-mode wedge alarm fires a
-# real OS-level desktop notification by default (bin/fm-supervise-daemon.sh's
-# wedge_alarm_emit). Point its FM_WEDGE_ALARM_EXEC seam at a recorder for every
+# real OS-level desktop notification by default. Point its FM_WEDGE_ALARM_EXEC
+# seam at a recorder for every
 # daemon/wake suite, so no test - present or future - can post a real macOS or
 # herdr notification: it is impossible to forget, because sourcing this harness
 # installs it. The recorder is an on-disk script (a real daemon a test spawns

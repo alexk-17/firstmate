@@ -113,8 +113,9 @@
 #                                   of invoking the real binary; "discard" fires
 #                                   nothing. Unset in production. When SOURCED the
 #                                   daemon defaults this to "discard" so no test
-#                                   can post a real notification (wedge_alarm_emit
-#                                   and the library-mode guard at the foot).
+#                                   can post a real notification
+#                                   (wedge_alarm_os_notifier_override and the
+#                                   library-mode guard at the foot).
 #          FM_WEDGE_ALARM_TIMEOUT_SECS seconds allowed for each notifier before
 #                                   its watchdog terminates it and continues to the
 #                                   next channel (default 10; invalid/zero uses the
@@ -757,12 +758,43 @@ wedge_alarm_run_bounded() {
   return "$rc"
 }
 
+# The single execution seam for the OS notifier channels (osascript, herdr).
+# FM_WEDGE_ALARM_EXEC, when set, REPLACES the real notifier: the resolved channel
+# name and summary are handed to that command instead of ever invoking osascript
+# or herdr. This is the one injection point the test harness forces to a recorder
+# so no test can post a real desktop notification - the library-mode guard at the
+# foot of this file defaults it to "discard" whenever the daemon is SOURCED
+# rather than executed, which is the only way a test reaches these functions. The
+# special value "discard" fires nothing; unset means production (the executed
+# daemon), so the real channels fire. The command: channel is deliberately NOT
+# routed here: it is a captain-supplied command, already fully under the
+# operator's own control.
+wedge_alarm_os_notifier_override() {  # <channel> <summary>
+  local channel=$1 summary=$2 rc exec_override=${FM_WEDGE_ALARM_EXEC:-}
+  case "$exec_override" in
+    '') return 2 ;;
+    discard) return 0 ;;
+    *)
+      wedge_alarm_run_bounded "$channel" "$exec_override" "$channel" "$summary" >/dev/null 2>&1
+      rc=$?
+      [ "$rc" -eq 0 ] && return 0
+      log "wedge alarm: notifier override exited $rc for channel '$channel'"
+      return 1 ;;
+  esac
+}
+
 # Post a macOS Notification Center banner. `display notification` is OS-level,
 # independent of any terminal pane or multiplexer status-line. The summary is
 # passed as an argv item (never interpolated into the AppleScript source) so its
 # text can never break the script. Best-effort: logs and returns 1 on failure.
 wedge_alarm_via_osascript() {  # <summary>
-  local summary=$1
+  local summary=$1 rc
+  wedge_alarm_os_notifier_override osascript "$summary"
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
   command -v osascript >/dev/null 2>&1 || {
     log "wedge alarm: osascript not found; cannot post a macOS notification"; return 1; }
   wedge_alarm_run_bounded osascript osascript -e 'on run argv' \
@@ -775,7 +807,13 @@ wedge_alarm_via_osascript() {  # <summary>
 # Post a herdr UI notification - herdr's own surface, separate from the pane and
 # its status-line. Best-effort: logs and returns 1 on failure.
 wedge_alarm_via_herdr() {  # <summary>
-  local summary=$1
+  local summary=$1 rc
+  wedge_alarm_os_notifier_override herdr "$summary"
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
   command -v herdr >/dev/null 2>&1 || {
     log "wedge alarm: herdr not found; cannot post a herdr notification"; return 1; }
   wedge_alarm_run_bounded herdr herdr notification show "firstmate: away-mode escalations WEDGED" \
@@ -794,33 +832,12 @@ wedge_alarm_via_command() {  # <cmd> <summary>
     <<< "$summary" >/dev/null 2>&1
   rc=$?
   [ "$rc" -eq 0 ] && return 0
-  log "wedge alarm: command channel exited $rc: $cmd"
+  log "wedge alarm: command channel exited $rc"
   return 1
 }
 
-# The single execution seam for the OS notifier channels (osascript, herdr).
-# FM_WEDGE_ALARM_EXEC, when set, REPLACES the real notifier: the resolved channel
-# name and summary are handed to that command instead of ever invoking osascript
-# or herdr. This is the one injection point the test harness forces to a recorder
-# so no test can post a real desktop notification - the library-mode guard at the
-# foot of this file defaults it to "discard" whenever the daemon is SOURCED
-# rather than executed, which is the only way a test reaches these functions. The
-# special value "discard" fires nothing; unset means production (the executed
-# daemon), so the real channels fire. The command: channel is deliberately NOT
-# routed here: it is a captain-supplied command, already fully under the
-# operator's own control.
 wedge_alarm_emit() {  # <channel> <summary>
-  local channel=$1 summary=$2 rc exec_override=${FM_WEDGE_ALARM_EXEC:-}
-  case "$exec_override" in
-    '') : ;;                      # production: fall through to the real notifier
-    discard) return 0 ;;          # library/test default: fire nothing
-    *)
-      wedge_alarm_run_bounded "$channel" "$exec_override" "$channel" "$summary" >/dev/null 2>&1
-      rc=$?
-      [ "$rc" -eq 0 ] && return 0
-      log "wedge alarm: notifier override exited $rc for channel '$channel'"
-      return 1 ;;
-  esac
+  local channel=$1 summary=$2
   case "$channel" in
     osascript) wedge_alarm_via_osascript "$summary" ;;
     herdr) wedge_alarm_via_herdr "$summary" ;;
@@ -831,8 +848,8 @@ wedge_alarm_emit() {  # <channel> <summary>
 # channel failure can never abort inject_wedge_alarm or the daemon loop. A lone
 # `off` directive disables the alert; an unresolvable `auto` (no OS channel on
 # this platform) logs that the durable marker is the only signal. The OS
-# notifiers route through wedge_alarm_emit (the test-forced recorder seam); the
-# captain-supplied command: channel runs directly.
+# notifiers route through the test-forced recorder seam; the captain-supplied
+# command: channel runs directly.
 wedge_alarm_notify() {  # <summary> <marker>
   local summary=$1 marker=$2 ch
   while IFS= read -r ch; do

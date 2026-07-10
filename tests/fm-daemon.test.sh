@@ -1095,7 +1095,7 @@ test_max_defer_afk_inactive_does_not_flush_or_alarm() {
 # log, so they verify channel SELECTION and summary propagation; the real
 # osascript/herdr argv is verified once by the bounded manual evidence in
 # docs/wedge-alarm.md, never from a suite.
-make_wedge_case() {  # <name> -> echoes dir; creates state/, fakebin/{uname,osascript}, alert.log
+make_wedge_case() {  # <name> -> echoes dir; creates state/, fakebin/{uname,osascript,herdr}, alert.log
   local name=$1 dir fakebin
   dir="$TMP_ROOT/$name"; fakebin="$dir/fakebin"
   mkdir -p "$dir/state" "$fakebin"
@@ -1104,14 +1104,18 @@ make_wedge_case() {  # <name> -> echoes dir; creates state/, fakebin/{uname,osas
 #!/usr/bin/env bash
 printf '%s\n' "${FM_FAKE_UNAME:-Darwin}"
 SH
-  # No-op osascript so wedge_alarm_platform_default's `command -v osascript`
-  # presence check passes on non-macOS CI. NEVER executed: the recorder seam
-  # intercepts every OS notifier before any real binary could run.
+  # Fakes keep command discovery deterministic on any CI host.
   cat > "$fakebin/osascript" <<'SH'
 #!/usr/bin/env bash
+printf '%s\n' osascript >> "${FM_WEDGE_ALARM_REAL_LOG:-/dev/null}"
 exit 0
 SH
-  chmod +x "$fakebin/uname" "$fakebin/osascript"
+  cat > "$fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' herdr >> "${FM_WEDGE_ALARM_REAL_LOG:-/dev/null}"
+exit 0
+SH
+  chmod +x "$fakebin/uname" "$fakebin/osascript" "$fakebin/herdr"
   : > "$dir/alert.log"
   printf '%s\n' "$dir"
 }
@@ -1137,6 +1141,17 @@ test_wedge_alarm_discard_seam_fires_nothing() {
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
   [ ! -s "$log" ] || fail "the discard seam still fired an OS notifier: $(cat "$log")"
   pass "the discard seam suppresses every OS notifier (fires nothing)"
+}
+
+test_wedge_alarm_direct_notifiers_honor_discard_seam() {
+  local dir real_log
+  dir=$(make_wedge_case wedge-direct-discard); real_log="$dir/real.log"
+  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_REAL_LOG="$real_log" FM_WEDGE_ALARM_EXEC=discard \
+    wedge_alarm_via_osascript "away-mode WEDGED 900s"
+  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_REAL_LOG="$real_log" FM_WEDGE_ALARM_EXEC=discard \
+    wedge_alarm_via_herdr "away-mode WEDGED 900s"
+  [ ! -s "$real_log" ] || fail "direct OS notifier helpers bypassed the discard seam: $(cat "$real_log")"
+  pass "direct OS notifier helpers honor the discard seam"
 }
 
 test_wedge_alarm_osascript_channel_selected() {
@@ -1173,6 +1188,21 @@ test_wedge_alarm_command_channel_receives_summary() {
   [ "$(cat "$out_argv" 2>/dev/null)" = "away-mode WEDGED 900s" ] || fail "command channel did not receive the summary on \$1"
   grep -F 'away-mode WEDGED 900s' "$out_stdin" >/dev/null || fail "command channel did not receive the summary on stdin"
   pass "command channel runs the captain command with the summary on \$1 and on stdin"
+}
+
+test_wedge_alarm_command_failure_hides_configured_command() {
+  local dir daemon_log secret rc
+  dir=$(make_wedge_case wedge-command-redaction); daemon_log="$dir/daemon.log"
+  secret="https://alerts.example.invalid/hook?token=private-wedge-token"
+  LOG="$daemon_log" FM_WEDGE_ALARM_CHANNEL="command:exit 73 # $secret" \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "a failed command channel made wedge_alarm_notify return non-zero ($rc)"
+  grep -F 'command channel exited 73' "$daemon_log" >/dev/null \
+    || fail "command channel failure did not log its exit status: $(cat "$daemon_log" 2>/dev/null)"
+  grep -F "$secret" "$daemon_log" >/dev/null \
+    && fail "command channel failure leaked its configured command: $(cat "$daemon_log")"
+  pass "command channel failures log only their safe exit status"
 }
 
 test_wedge_alarm_off_disables_active_alert() {
@@ -1577,9 +1607,11 @@ test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard
 test_wedge_alarm_discard_seam_fires_nothing
+test_wedge_alarm_direct_notifiers_honor_discard_seam
 test_wedge_alarm_osascript_channel_selected
 test_wedge_alarm_herdr_channel_selected
 test_wedge_alarm_command_channel_receives_summary
+test_wedge_alarm_command_failure_hides_configured_command
 test_wedge_alarm_off_disables_active_alert
 test_wedge_alarm_auto_darwin_selects_osascript
 test_wedge_alarm_auto_non_darwin_has_no_os_channel
