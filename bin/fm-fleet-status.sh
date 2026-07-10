@@ -166,7 +166,10 @@ printf '%s' "$SNAPSHOT" | jq -r \
 
     def phase_of($t):
       $t.current_state.state as $s | $t.current_state.source as $src
-      | if $s == "unknown" then "unknown"
+      | if $t.kind == "secondmate" then
+          (if $t.endpoint.exists == false or $t.endpoint.agent_alive == "dead" then "unknown"
+           else "supervising" end)
+        elif $s == "unknown" then "unknown"
         elif $s == "failed" then "failed"
         elif $s == "blocked" then "blocked"
         elif $s == "paused" then "paused"
@@ -195,6 +198,7 @@ printf '%s' "$SNAPSHOT" | jq -r \
 
     def owner_of($t; $phase):
       if $phase == "unknown" then "unknown"
+      elif $phase == "supervising" then "firstmate"
       elif $phase == "failed" then "firstmate"
       elif $phase == "needs-decision" then
         (if (is_ask_user($t) or $t.hints.pending_decision == true) then "captain" else "crew" end)
@@ -224,6 +228,7 @@ printf '%s' "$SNAPSHOT" | jq -r \
       elif $phase == "ready" and ($t.pr.url != null) then "merge when ready"
       elif $phase == "ready" then "review diff, then approve"
       elif $phase == "validating" then "checks / CI"
+      elif $phase == "supervising" then "supervising its domain"
       elif $phase == "working" then "implementation in progress"
       elif $phase == "paused" then "waiting on external event"
       elif $phase == "blocked" then "firstmate to unblock"

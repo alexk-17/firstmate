@@ -24,6 +24,10 @@ NOW=2000000000
 # pane, then the status log) and whose tmux marks a window busy only when its
 # target name contains "busy". That busy trigger is how a test forces a
 # reconciled `working` current state that overrides a stale status-log verb.
+# The foreground command a window reports is normally a harness binary (codex,
+# so fm_backend_agent_alive reads a secondmate's agent as alive), except a target
+# whose name contains "dead" reports a bare shell, which that probe classifies as
+# a stopped agent - the trigger a test uses to force a dead secondmate.
 make_fakebin() {  # <dir>
   local fb
   fb=$(fm_fakebin "$1")
@@ -43,7 +47,12 @@ done
 case "${1:-}" in
   display-message)
     case "$*" in
-      *pane_current_command*) printf 'codex\n' ;;
+      *pane_current_command*)
+        case "$target" in
+          *dead*) printf 'zsh\n' ;;
+          *) printf 'codex\n' ;;
+        esac
+        ;;
       *) printf '%%1\n' ;;
     esac
     ;;
@@ -254,6 +263,39 @@ test_section_filter() {
   pass "--section filters the projection and rejects unknown names"
 }
 
+test_secondmate_classification() {
+  local home fakebin out
+  home=$(make_home secondmate)
+  mkdir -p "$home/live-home" "$home/dead-home"
+  # A live persistent secondmate. Its status log carries a needs-decision
+  # escalation that, folded into the task-phase vocabulary, would resolve to a
+  # captain decision and land in NEEDS YOU. Because it is a live secondmate it
+  # must instead get its OWN representation - phase supervising, owner firstmate,
+  # health from agent liveness - and stay in RUNNING, never the decision queue.
+  fm_write_secondmate_meta "$home/state/secmate-live.meta" \
+    "$home/live-home" "firstmate:fm-secmate-live" "alpha"
+  printf 'needs-decision: which audit approach\n' > "$home/state/secmate-live.status"
+  # A dead secondmate: its endpoint pane exists but sits at a bare shell (its
+  # agent has exited). A stopped supervisor must surface in AT RISK, never be
+  # hidden as a routine escalation, even with the same needs-decision log line.
+  fm_write_secondmate_meta "$home/state/secmate-dead.meta" \
+    "$home/dead-home" "firstmate:fm-secmate-dead" "beta"
+  printf 'needs-decision: which audit approach\n' > "$home/state/secmate-dead.status"
+
+  fakebin=$(make_fakebin "$home")
+  out=$(run_json "$home" "$fakebin") || fail "secondmate --json must exit 0"
+  printf '%s' "$out" | jq -e '
+    def row($id): (.sections.needs_you + .sections.at_risk + .sections.running)[] | select(.id == $id);
+    (([.sections.running[].id] | index("secmate-live")) != null)
+      and (row("secmate-live") | .phase == "supervising" and .owner == "firstmate"
+            and .health == "active" and .section == "running")
+      and (([.sections.needs_you[].id] | index("secmate-live")) == null)
+      and (([.sections.at_risk[].id] | index("secmate-dead")) != null)
+      and (row("secmate-dead") | .health == "dead" and .section == "at_risk")
+  ' >/dev/null || fail "secondmate classification wrong: $out"
+  pass "live secondmate is supervising/firstmate in RUNNING; a dead one lands in AT RISK"
+}
+
 test_repo_normalizes_project_path() {
   local home fakebin out
   home=$(make_home reponorm)
@@ -279,4 +321,5 @@ test_section_bucketing_by_owner
 test_reconcile_over_stale_status_log
 test_graceful_unresolvable_task
 test_section_filter
+test_secondmate_classification
 test_repo_normalizes_project_path
