@@ -6,13 +6,15 @@
 # function's output is a deterministic function of its arguments alone - it does
 # NO terminal I/O, reads no state files, and touches no globals it was not
 # passed. The impure raw-mode input/refresh loop and the escape-sequence
-# emission live in fm-dock.sh and are deliberately NOT unit-tested; this library
-# is (tests/fm-dock-tui.test.sh).
+# emission live in fm-dock.sh; those are covered by the pseudo-terminal
+# integration tests (tests/fm-dock-tui-pty.test.sh), while this library is
+# covered by fm-dock-tui.test.sh.
 #
 # What is pure and tested here:
 #   render        fm_dock_render_list / fm_dock_render_detail turn a fleet-status
-#                 JSON projection (+ inbox array, selection index, width, color,
-#                 clock stamp, flash) into the exact screen string.
+#                 JSON projection (+ inbox array, selection index, terminal
+#                 width AND height, color, clock stamp, flash) into the exact
+#                 screen string, width-clipped and height-bounded to a viewport.
 #   selection     fm_dock_actionable_ids / _count / _nth_id / _clamp_sel /
 #                 _move_sel are the cursor state machine over the actionable list
 #                 (NEEDS YOU ++ AT RISK ++ RUNNING, in that fixed order - the same
@@ -107,12 +109,28 @@ fm_dock_action_is_destructive() {  # <action>
 # Color/paint/clip/glyph/phase-color helpers reused by both renderers. Kept as a
 # jq string so each (separate) jq invocation compiles the same helpers. The $vars
 # below are jq variables, not shell - the single quotes are intentional.
+#
+# fit() is the viewport's width guard: it truncates a single physical line to
+# $width VISIBLE columns. In color mode it walks the line as alternating SGR
+# escapes (zero width, always kept) and text runs (counted, truncated), so a line
+# is never cut mid-escape and a colored line never overflows on visible width.
+# clip() adds a semantic ellipsis to one field; fit() is the final hard bound
+# applied to EVERY emitted line so the header, footer, urls, and keymaps can
+# never overflow the terminal.
 # shellcheck disable=SC2016
 FM_DOCK_JQ_PRELUDE='
   def esc($c): if $color then "\u001b[\($c)m" else "" end;
   def reset: esc("0");
   def paint($c; $s): esc($c) + $s + reset;
   def clip($s): ($s // "") | if (. | length) > $width then (.[0:($width - 1)] + "…") else . end;
+  def fit($s):
+    if $color then
+      (reduce ([$s | scan("\u001b\\[[0-9;]*m|[^\u001b]+")][]) as $c ({a:"", n:0};
+        if ($c | test("^\u001b")) then {a:(.a + $c), n:.n}
+        else ($width - .n) as $room
+          | if $room <= 0 then . else {a:(.a + $c[0:$room]), n:(.n + ([($c|length), $room] | min))} end
+        end)).a + esc("0")
+    else ($s // "")[0:$width] end;
   def glyph($h):
     if $h == "active" then "●" elif $h == "idle" then "○"
     elif $h == "stale" then "▲" elif $h == "dead" then "✖" else "?" end;
@@ -132,54 +150,70 @@ FM_DOCK_JQ_PRELUDE='
 
 # --- list view render (pure) ------------------------------------------------
 
-# Render the full-screen list: header (home + clock + refresh cadence), the four
-# health-coded sections with the cursor marker on row <sel>, the inbox strip, an
-# optional flash line, and the footer keymap. Deterministic given its args.
-fm_dock_render_list() {  # <status_json> <sel> <width> <color> <stamp> <refresh> [inbox_json] [flash]
-  local sjson=$1 sel=$2 width=$3 color=$4 stamp=$5 refresh=$6 inbox=${7:-[]} flash=${8:-}
+# Render the full-screen list into a viewport of exactly <= $rows lines and
+# <= $width columns per line: a fixed header (home + clock + refresh cadence), the
+# four health-coded sections (one line per task, cursor marker on row <sel>), and
+# a fixed footer (inbox strip + optional flash + keymap). When the body exceeds
+# the height between header and footer, it scrolls to a window that always keeps
+# the selected row visible. Deterministic given its args.
+fm_dock_render_list() {  # <status_json> <sel> <width> <rows> <color> <stamp> <refresh> [inbox_json] [flash]
+  local sjson=$1 sel=$2 width=$3 rows=$4 color=$5 stamp=$6 refresh=$7 inbox=${8:-[]} flash=${9:-}
   case "$sel" in ''|*[!0-9]*) sel=0 ;; esac
   case "$width" in ''|*[!0-9]*) width=80 ;; esac
   [ "$width" -ge 20 ] || width=20
+  case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+  [ "$rows" -ge 6 ] || rows=6
   printf '%s' "$sjson" | jq -r \
-    --argjson sel "$sel" --argjson width "$width" --argjson color "$color" \
+    --argjson sel "$sel" --argjson width "$width" --argjson rows "$rows" --argjson color "$color" \
     --arg stamp "$stamp" --arg refresh "$refresh" --argjson inbox "$inbox" --arg flash "$flash" \
     "$FM_DOCK_JQ_PRELUDE"'
-    def arow($r; $g):
-      (if $g == $sel then paint("1;36"; "›") else " " end) as $cur
-      | ($cur + " " + paint("1"; $r.id) + "  "
-         + paint(hcol($r.health); glyph($r.health))
-         + " " + paint(pcol($r.phase); ($r.phase // "-"))
-         + " " + esc("2") + "·" + reset + " " + ($r.owner // "-")
-         + " " + esc("2") + "· " + ($r.freshness.age // "-") + reset)
-        + "\n     " + esc("2") + clip($r.next_action // $r.headline // "-") + reset;
-    def sec($rows; $off; $title; $code; $empty):
-      [ paint($code + ";1"; $title) + paint("2"; "  (\($rows | length))") ]
-      + (if ($rows | length) == 0 then [ "  " + esc("2") + $empty + reset ]
-         else [ $rows | to_entries[] | arow(.value; $off + .key) ] end)
-      + [ "" ];
+    # One line per task (cursor · id · glyph · phase · owner · age — next action).
+    def rowline($r; $g):
+      (if $g == $sel then paint("1;36"; "›") else " " end)
+      + " " + paint("1"; ($r.id // "-")) + " "
+      + paint(hcol($r.health); glyph($r.health))
+      + " " + paint(pcol($r.phase); ($r.phase // "-"))
+      + " " + esc("2") + "·" + reset + " " + ($r.owner // "-")
+      + " " + esc("2") + "· " + ($r.freshness.age // "-") + reset
+      + esc("2") + "  — " + ($r.next_action // $r.headline // "-") + reset;
+    # A section header plus its rows, as {t:<line>, s:<is-selected-row>} records.
+    def secbody($items; $off; $title; $code; $empty):
+      [ {t: (paint($code + ";1"; $title) + paint("2"; "  (\($items | length))")), s:false} ]
+      + (if ($items | length) == 0 then [ {t: ("  " + esc("2") + $empty + reset), s:false} ]
+         else [ $items | to_entries[] | {t: rowline(.value; $off + .key), s: (($off + .key) == $sel)} ] end)
+      + [ {t:"", s:false} ];
     def donerow($r):
       "  " + paint("1"; ($r.id // "-")) + "  "
-      + esc("2") + clip(($r.title // "-") + "  [" + ($r.repo // "-") + "] " + ($r.artifact // "-")) + reset;
+      + esc("2") + (($r.title // "-") + "  [" + ($r.repo // "-") + "] " + ($r.artifact // "-")) + reset;
+
     (.sections.needs_you // []) as $ny
     | (.sections.at_risk // []) as $ar
     | (.sections.running // []) as $ru
     | (.sections.recently_done // []) as $rd
     | ($ny | length) as $n1 | ($ar | length) as $n2
     | ([ paint("1;36"; "Fleet Dock") + "  " + esc("2") + (.fm_home // "-") + reset
-         + "   " + esc("2") + $stamp + " ⟳" + $refresh + "s" + reset, "" ]
-       + sec($ny; 0; "NEEDS YOU"; "33"; "Nothing needs you.")
-       + sec($ar; $n1; "AT RISK"; "31"; "Nothing at risk.")
-       + sec($ru; ($n1 + $n2); "RUNNING"; "36"; "No tasks in flight.")
-       + [ paint("32;1"; "RECENTLY DONE") + paint("2"; "  (\($rd | length))") ]
-       + (if ($rd | length) == 0 then [ "  " + esc("2") + "No recently completed work." + reset ]
-          else [ $rd[] | donerow(.) ] end)
-       + [ "",
-           (esc("2") + "inbox:" + reset + " "
-            + (if ($inbox | length) == 0 then esc("2") + "(empty)" + reset
-               else ([ $inbox[] | paint(istat(.status); (.action // "?") + "/" + (.task_id // "?")) ] | join("  ")) end)),
-           (if $flash == "" then empty else paint("1;37"; "» " + $flash) end),
-           paint("2"; "↑/↓ move · enter detail · a answer · n note · m merge · p peek · i interrupt · t teardown · q quit") ])
-      | join("\n")
+         + "   " + esc("2") + $stamp + " ⟳" + $refresh + "s" + reset, "" ]) as $head
+    | ([ (esc("2") + "inbox:" + reset + " "
+          + (if ($inbox | length) == 0 then esc("2") + "(empty)" + reset
+             else ([ $inbox[] | paint(istat(.status); (.action // "?") + "/" + (.task_id // "?")) ] | join("  ")) end)) ]
+       + (if $flash == "" then [] else [ paint("1;37"; "» " + $flash) ] end)
+       + [ paint("2"; "↑↓ move · ⏎ detail · a answer n note m merge p peek i intr t tear · q quit") ]) as $foot
+    | (secbody($ny; 0; "NEEDS YOU"; "33"; "Nothing needs you.")
+       + secbody($ar; $n1; "AT RISK"; "31"; "Nothing at risk.")
+       + secbody($ru; ($n1 + $n2); "RUNNING"; "36"; "No tasks in flight.")
+       + [ {t: (paint("32;1"; "RECENTLY DONE") + paint("2"; "  (\($rd | length))")), s:false} ]
+       + (if ($rd | length) == 0 then [ {t: ("  " + esc("2") + "No recently completed work." + reset), s:false} ]
+          else [ $rd[] | {t: donerow(.), s:false} ] end)) as $body
+    # Scroll the body to a window that fits between the header and footer and
+    # always contains the selected row.
+    | ([$rows - ($head | length) - ($foot | length), 1] | max) as $avail
+    | (if ($body | length) <= $avail then $body
+       else
+         ([ $body | to_entries[] | select(.value.s) | .key ] | (.[0] // 0)) as $seli
+         | ([ [$seli - (($avail / 2) | floor), 0] | max, ($body | length) - $avail ] | min) as $start
+         | $body[$start : $start + $avail]
+       end) as $win
+    | ($head + [ $win[].t ] + $foot) | map(fit(.)) | join("\n")
     '
 }
 
@@ -188,16 +222,19 @@ fm_dock_render_list() {  # <status_json> <sel> <width> <color> <stamp> <refresh>
 # Render the detail card for one task from a detail object assembled by the loop
 # (bin/fm-dock.sh's build_detail): identity/config fields, the reconciled live
 # state line, the decision text + options when the task is awaiting a decision,
-# and a short recent-status tail. Deterministic given its args.
-fm_dock_render_detail() {  # <detail_json> <width> <color>
-  local djson=$1 width=$2 color=$3
+# and a short recent-status tail. Every line is width-clipped and the card is
+# bounded to <= $rows lines. Deterministic given its args.
+fm_dock_render_detail() {  # <detail_json> <width> <rows> <color>
+  local djson=$1 width=$2 rows=$3 color=$4
   case "$width" in ''|*[!0-9]*) width=80 ;; esac
   [ "$width" -ge 20 ] || width=20
+  case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+  [ "$rows" -ge 6 ] || rows=6
   printf '%s' "$djson" | jq -r \
-    --argjson width "$width" --argjson color "$color" \
+    --argjson width "$width" --argjson rows "$rows" --argjson color "$color" \
     "$FM_DOCK_JQ_PRELUDE"'
     def val($v): ($v | if . == "" or . == null then "-" else . end);
-    [ paint("1;36"; "Task " + (.id // "-")) + "   " + esc("2") + "esc back · q quit" + reset, "",
+    ([ paint("1;36"; "Task " + (.id // "-")) + "   " + esc("2") + "esc back · q quit" + reset, "",
       "  project   " + val(.project),
       "  harness   " + val(.harness),
       "  mode      " + val(.mode),
@@ -207,16 +244,16 @@ fm_dock_render_detail() {  # <detail_json> <width> <color>
         + " " + esc("2") + "·" + reset + " " + (.owner // "-")
         + " " + esc("2") + "·" + reset + " " + paint(hcol(.health // "-"); (.health // "-"))
         + " " + esc("2") + "· " + (.age // "-") + reset,
-      (if (.crew_state // "") == "" then empty else "  live      " + esc("2") + clip(.crew_state) + reset end),
+      (if (.crew_state // "") == "" then empty else "  live      " + esc("2") + (.crew_state) + reset end),
       (if .pr_url == null then empty else "  pr        " + .pr_url end),
       "" ]
     + (if (.decision.present // false)
-       then [ paint("33;1"; "  DECISION NEEDED"), "  " + clip(.decision.text // "-"), "" ]
+       then [ paint("33;1"; "  DECISION NEEDED"), "  " + (.decision.text // "-"), "" ]
        else [] end)
     + [ paint("2"; "  recent status:") ]
     + (if ((.status_tail // []) | length) == 0 then [ "    " + esc("2") + "(none)" + reset ]
-       else [ .status_tail[] | "    " + esc("2") + clip(.) + reset ] end)
-    + [ "", paint("2"; "  a answer · n note · m merge · p peek · i interrupt · t teardown · esc back · q quit") ]
-    | join("\n")
+       else [ .status_tail[] | "    " + esc("2") + (.) + reset ] end)
+    + [ "", paint("2"; "  a answer n note m merge p peek i intr t tear · esc back · q quit") ])
+    | .[0:$rows] | map(fit(.)) | join("\n")
     '
 }

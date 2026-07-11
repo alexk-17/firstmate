@@ -80,7 +80,7 @@ test_key_to_action_dispatch() {
 
 test_render_list_structure_and_plain() {
   local out
-  out=$(fm_dock_render_list "$SJSON" 1 80 false "12:00:00" 3 '[]' '')
+  out=$(fm_dock_render_list "$SJSON" 1 80 40 false "12:00:00" 3 '[]' '')
   assert_contains "$out" "Fleet Dock" "list must render the header"
   assert_contains "$out" "/tmp/home" "list header shows the fleet home"
   assert_contains "$out" "⟳3s" "list header shows the refresh cadence"
@@ -94,6 +94,7 @@ test_render_list_structure_and_plain() {
   assert_contains "$out" "●" "active health uses its glyph"
   assert_contains "$out" "○" "idle health uses its glyph"
   assert_contains "$out" "a answer" "footer shows the keymap"
+  assert_contains "$out" "q quit" "footer keymap is not clipped at the default 80-col width"
   # sel=1 -> the cursor marks stale-b2, not decide-a1.
   assert_contains "$out" "› stale-b2" "the cursor marker lands on the selected row"
   assert_not_contains "$out" "› decide-a1" "unselected rows carry no cursor marker"
@@ -104,13 +105,13 @@ test_render_list_structure_and_plain() {
 
 test_render_list_color_and_flash_and_inbox() {
   local out inbox
-  out=$(fm_dock_render_list "$SJSON" 0 80 true "12:00:00" 3 '[]' '')
+  out=$(fm_dock_render_list "$SJSON" 0 80 40 true "12:00:00" 3 '[]' '')
   assert_contains "$out" "$(printf '\033')" "color render must contain ANSI escapes"
   inbox='[{"intent_id":"i1","task_id":"decide-a1","action":"note","status":"pending","ts":5}]'
-  out=$(fm_dock_render_list "$SJSON" 0 80 false "12:00:00" 3 "$inbox" "queued: note decide-a1")
+  out=$(fm_dock_render_list "$SJSON" 0 80 40 false "12:00:00" 3 "$inbox" "queued: note decide-a1")
   assert_contains "$out" "inbox: note/decide-a1" "inbox strip shows the captain's recent intent"
   assert_contains "$out" "» queued: note decide-a1" "a flash line renders when set"
-  out=$(fm_dock_render_list "$SJSON" 0 80 false "12:00:00" 3 '[]' '')
+  out=$(fm_dock_render_list "$SJSON" 0 80 40 false "12:00:00" 3 '[]' '')
   assert_contains "$out" "inbox: (empty)" "empty inbox renders an explicit empty marker"
   assert_not_contains "$out" "» " "no flash line renders when the flash is empty"
   pass "color, flash, and inbox strip render correctly"
@@ -118,7 +119,7 @@ test_render_list_color_and_flash_and_inbox() {
 
 test_render_list_empty_is_safe() {
   local out
-  out=$(fm_dock_render_list "$EMPTY" 0 80 false "12:00:00" 3 '[]' '') \
+  out=$(fm_dock_render_list "$EMPTY" 0 80 40 false "12:00:00" 3 '[]' '') \
     || fail "rendering an empty projection must not error"
   assert_contains "$out" "Nothing needs you." "empty needs-you shows its note"
   assert_contains "$out" "No tasks in flight." "empty running shows its note"
@@ -129,7 +130,7 @@ test_render_list_empty_is_safe() {
 test_render_detail() {
   local out djson
   djson='{"id":"decide-a1","project":"alpha","harness":"claude","mode":"no-mistakes","kind":"ship","phase":"needs-decision","owner":"captain","health":"idle","age":"2m","pr_url":null,"branch":"fm/decide-a1","crew_state":"state: parked","decision":{"present":true,"text":"needs-decision: A or B"},"status_tail":["working: start","needs-decision: A or B"]}'
-  out=$(fm_dock_render_detail "$djson" 80 false)
+  out=$(fm_dock_render_detail "$djson" 80 40 false)
   assert_contains "$out" "Task decide-a1" "detail titles the task"
   assert_contains "$out" "project   alpha" "detail shows the project"
   assert_contains "$out" "harness   claude" "detail shows the harness"
@@ -146,11 +147,39 @@ test_render_detail() {
 test_render_detail_no_decision() {
   local out djson
   djson='{"id":"run-c3","project":"alpha","harness":"codex","mode":"direct-PR","kind":"ship","phase":"validating","owner":"ci","health":"active","age":"30s","pr_url":"https://example/pr/9","branch":"-","crew_state":"","decision":{"present":false,"text":""},"status_tail":[]}'
-  out=$(fm_dock_render_detail "$djson" 80 false)
+  out=$(fm_dock_render_detail "$djson" 80 40 false)
   assert_not_contains "$out" "DECISION NEEDED" "a task not awaiting a decision shows no decision card"
   assert_contains "$out" "pr        https://example/pr/9" "detail shows a PR url when present"
   assert_contains "$out" "(none)" "an empty status tail renders an explicit marker"
   pass "detail view omits the decision card and shows the PR url when there is no gate"
+}
+
+test_render_list_width_clip() {
+  command -v python3 >/dev/null 2>&1 || { pass "width-clip check skipped (python3 absent)"; return 0; }
+  local out mv
+  # Plain, width 20: no physical line may exceed 20 codepoints.
+  out=$(fm_dock_render_list "$SJSON" 1 20 24 false "12:00:00" 3 '[]' 'a very long flash that must be clipped hard')
+  mv=$(printf '%s\n' "$out" | python3 -c 'import sys; print(max((len(l.rstrip(chr(10))) for l in sys.stdin), default=0))')
+  [ "$mv" -le 20 ] || fail "plain lines must clip to width 20, got max $mv"
+  # Color, width 20: the VISIBLE width (ANSI stripped) must still be <= 20, and a
+  # line must never be cut mid-escape.
+  out=$(fm_dock_render_list "$SJSON" 1 20 24 true "12:00:00" 3 '[]' '')
+  mv=$(printf '%s\n' "$out" | python3 -c 'import sys,re; print(max((len(re.sub(chr(27)+r"\[[0-9;]*m","",l.rstrip(chr(10)))) for l in sys.stdin), default=0))')
+  [ "$mv" -le 20 ] || fail "colored lines must clip to VISIBLE width 20, got max $mv"
+  pass "every rendered line is clipped to the terminal width (plain and colored)"
+}
+
+test_render_list_viewport() {
+  command -v python3 >/dev/null 2>&1 || { pass "viewport check skipped (python3 absent)"; return 0; }
+  local big out nlines
+  big=$(python3 -c 'import json; print(json.dumps({"fm_home":"/h","sections":{"needs_you":[],"at_risk":[],"running":[{"id":"t%02d"%i,"health":"active","phase":"working","owner":"crew","freshness":{"age":"1m"},"next_action":"x","headline":"h"} for i in range(30)],"recently_done":[]}}))')
+  # 30 tasks, selection deep in the list, a 10-row terminal.
+  out=$(fm_dock_render_list "$big" 25 80 10 false "12:00" 3 '[]' '')
+  nlines=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+  [ "$nlines" -le 10 ] || fail "viewport must bound output to rows=10, got $nlines lines"
+  assert_contains "$out" "› t25" "the selected row stays inside the scrolled viewport"
+  assert_contains "$out" "q quit" "the footer keymap stays visible while scrolling"
+  pass "the list is bounded to a viewport that keeps the selection and footer visible"
 }
 
 test_actionable_order_and_count
@@ -159,5 +188,7 @@ test_key_to_action_dispatch
 test_render_list_structure_and_plain
 test_render_list_color_and_flash_and_inbox
 test_render_list_empty_is_safe
+test_render_list_width_clip
+test_render_list_viewport
 test_render_detail
 test_render_detail_no_decision

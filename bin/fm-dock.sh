@@ -72,9 +72,11 @@ require_jq() {
   command -v jq >/dev/null 2>&1 || { echo "error: fm-dock.sh requires jq" >&2; exit 1; }
 }
 
-# Color only for an interactive, color-allowed terminal; otherwise plain.
+# Color only for an interactive, color-allowed terminal; otherwise plain. The
+# NO_COLOR spec disables color whenever the variable is PRESENT, even when empty,
+# so test presence with ${NO_COLOR+x}, never value-emptiness.
 COLOR=false
-if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ] && [ -t 1 ]; then
+if [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ] && [ -t 1 ]; then
   COLOR=true
 fi
 paint() {  # <ansi-code> <text>
@@ -223,7 +225,9 @@ cmd_interactive_picker() {
 # A real interactive terminal on both ends, with the tput we need to drive it.
 tui_has_tty() { [ -t 0 ] && [ -t 1 ] && command -v tput >/dev/null 2>&1; }
 # Auto-select the TUI only when it will also be legible (color-capable terminal).
-tui_auto() { tui_has_tty && [ "${TERM:-}" != dumb ] && [ -z "${NO_COLOR:-}" ]; }
+# NO_COLOR present (even empty) means fall back to the picker: test with
+# ${NO_COLOR+x}, not value-emptiness, so NO_COLOR= is honored.
+tui_auto() { tui_has_tty && [ "${TERM:-}" != dumb ] && [ -z "${NO_COLOR+x}" ]; }
 
 # Read one static config value from a task's live meta (not fleet STATE; the
 # renderer's fleet state still comes only from fm-fleet-status.sh).
@@ -289,28 +293,28 @@ tui_teardown() {
   [ -n "$TUI_SAVED_STTY" ] && stty "$TUI_SAVED_STTY" 2>/dev/null || true
 }
 
-# Bottom-line single-key confirm; returns 0 only on y/Y. Restores the hidden
-# cursor for the prompt and re-hides it after.
+# Bottom-line single-key confirm; returns 0 only on y/Y. All terminal control and
+# the keypress go through /dev/tty (the controlling terminal), NEVER stdout/stdin,
+# so a caller in command substitution cannot capture any of it.
 tui_confirm() {  # <prompt>
   local ans rows
   rows=$(tput lines 2>/dev/null) || rows=24
-  tput cnorm 2>/dev/null || true
-  tput cup "$((rows - 1))" 0 2>/dev/null || true
-  printf '\033[2K%s' "$1"
-  IFS= read -rsn1 ans || { tput civis 2>/dev/null || true; return 1; }
-  tput civis 2>/dev/null || true
+  { tput cnorm; tput cup "$((rows - 1))" 0; printf '\033[2K%s' "$1"; } >/dev/tty 2>/dev/null || true
+  IFS= read -rsn1 ans </dev/tty || { tput civis >/dev/tty 2>/dev/null || true; return 1; }
+  tput civis >/dev/tty 2>/dev/null || true
   case "$ans" in y|Y) return 0 ;; *) return 1 ;; esac
 }
 
-# Bottom-line single-line prompt for a payload; echoes the line (empty on EOF).
-tui_prompt() {  # <prompt>
+# Bottom-line single-line payload prompt. The prompt bytes, cursor moves, and the
+# echoed keystrokes ALL go to /dev/tty; only the entered line is written to
+# stdout. This is the fix for the payload-contamination bug: tui_action captures
+# this in $(...), so anything but the bare line would end up inside the intent.
+tui_prompt() {  # <prompt>  -> stdout: the entered line only
   local line rows
   rows=$(tput lines 2>/dev/null) || rows=24
-  tput cnorm 2>/dev/null || true
-  tput cup "$((rows - 1))" 0 2>/dev/null || true
-  printf '\033[2K%s' "$1"
-  IFS= read -r line || line=""
-  tput civis 2>/dev/null || true
+  { tput cnorm; tput cup "$((rows - 1))" 0; printf '\033[2K%s' "$1"; } >/dev/tty 2>/dev/null || true
+  IFS= read -r line </dev/tty || line=""
+  tput civis >/dev/tty 2>/dev/null || true
   printf '%s' "$line"
 }
 
@@ -344,49 +348,61 @@ cmd_tui() {
   [ "$refresh" -ge 1 ] || refresh=3
 
   TUI_SAVED_STTY=$(stty -g 2>/dev/null) || TUI_SAVED_STTY=""
-  trap 'tui_teardown; exit 0' INT TERM
+  # Restore the terminal on every exit path, and make a signal-driven exit
+  # DISTINGUISHABLE from a normal quit: INT->130, TERM->143 (a supervisor can tell
+  # the captain terminated the dock from a clean `q`). The EXIT trap re-runs
+  # teardown, which is idempotent.
+  trap 'tui_teardown; exit 130' INT
+  trap 'tui_teardown; exit 143' TERM
   trap 'tui_teardown' EXIT
-  trap ':' WINCH   # interrupt the read so the loop re-renders at the new size
+  # bash 3.2's timed `read` is NOT reliably interrupted by SIGWINCH, so a resize
+  # is picked up on the next refresh tick (within $refresh seconds) rather than
+  # instantly. The trap is harmless and does interrupt read on bash >=4.
+  trap ':' WINCH
   tput smcup 2>/dev/null || true
   tput civis 2>/dev/null || true
 
-  local view=list sel=0 sel_id="" status_json inbox_json cols stamp count screen
-  local key rest rc spin=0 spin_sec=0
+  local view=list sel=0 sel_id="" status_json inbox_json cols rowsn stamp count screen
+  local key rest rc before
   TUI_FLASH=""
   while :; do
     status_json=$("$STATUS_BIN" --json 2>/dev/null) || status_json='{}'
     inbox_json=$(collect_inbox)
     cols=$(tput cols 2>/dev/null) || cols=80
+    rowsn=$(tput lines 2>/dev/null) || rowsn=24
     stamp=$(date +%H:%M:%S)
     count=$(fm_dock_actionable_count "$status_json")
     sel=$(fm_dock_clamp_sel "$sel" "$count")
     sel_id=$(fm_dock_nth_id "$status_json" "$sel")
 
     if [ "$view" = detail ] && [ -n "$sel_id" ]; then
-      screen=$(fm_dock_render_detail "$(build_detail "$sel_id" "$status_json")" "$cols" "$COLOR")
+      screen=$(fm_dock_render_detail "$(build_detail "$sel_id" "$status_json")" "$cols" "$rowsn" "$COLOR")
     else
       view=list
-      screen=$(fm_dock_render_list "$status_json" "$sel" "$cols" "$COLOR" "$stamp" "$refresh" "$inbox_json" "$TUI_FLASH")
+      screen=$(fm_dock_render_list "$status_json" "$sel" "$cols" "$rowsn" "$COLOR" "$stamp" "$refresh" "$inbox_json" "$TUI_FLASH")
     fi
     printf '\033[2J\033[H%s' "$screen"
     TUI_FLASH=""   # a flash shows for exactly one refresh cycle
 
-    # One keypress, or an auto-refresh tick. read's status must be captured
-    # DIRECTLY (never behind `if !`, whose negation would clobber $?). A non-zero
-    # read means "no key this interval" -> re-render: bash 3.2 returns 1 on a
-    # timeout while bash >=4 returns >128, and a WINCH interrupt returns >128 on
-    # both. A closed stdin cannot occur on the interactive tty tui_has_tty
-    # guarantees; the spin guard is a belt-and-suspenders bail so a wedged fd can
-    # never busy-spin (a real timeout burns ~$refresh seconds, advancing SECONDS).
+    # One keypress, or an auto-refresh tick. read's status is captured DIRECTLY
+    # (never behind `if !`, whose negation would clobber $?). On a non-zero read,
+    # distinguish a genuine terminal EOF (Ctrl-D / closed stdin -> exit) from a
+    # refresh timeout (-> re-render):
+    #   bash >=4: a timeout returns >128 and EOF returns 1, so rc==1 IS EOF.
+    #   bash 3.2: BOTH return 1, so also require zero elapsed wall time - a real
+    #     >=1s timeout always advances SECONDS by >=1 (a >=1s span crosses a
+    #     second boundary), while EOF returns instantly. SIGWINCH does not
+    #     interrupt bash 3.2's timed read, so a zero-elapsed rc==1 is truly EOF.
     key=""
+    before=$SECONDS
     IFS= read -rsn1 -t "$refresh" key
     rc=$?
     if [ "$rc" -ne 0 ]; then
-      if [ "$SECONDS" -eq "$spin_sec" ]; then spin=$((spin + 1)); else spin=0; spin_sec=$SECONDS; fi
-      [ "$spin" -ge 100 ] && break
-      continue
+      if [ "$rc" -eq 1 ] && [ "$((SECONDS - before))" -eq 0 ]; then
+        break   # terminal EOF (Ctrl-D / closed input) -> clean exit
+      fi
+      continue  # timeout (or a bash>=4 signal-interrupted read) -> re-render
     fi
-    spin=0
     # Decode an arrow-key escape sequence (ESC [ A/B/C/D). Integer -t only: bash
     # 3.2 rejects a fractional timeout. The two continuation bytes arrive with the
     # ESC so this returns instantly; a lone ESC waits out the 1s, then registers.
@@ -398,6 +414,9 @@ cmd_tui() {
         *) key=esc ;;
       esac
     fi
+    # Ctrl-D quits whether the terminal delivers it as EOF (handled above) or, in
+    # a non-canonical read, as a literal 0x04 byte.
+    [ "$key" = $'\004' ] && break
 
     if [ "$view" = detail ]; then
       case "$key" in
