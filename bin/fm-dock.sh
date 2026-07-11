@@ -15,27 +15,33 @@
 # TUI choice: a keyboard-driven picker LOOP, not a full-screen curses TUI. A
 # curses UI in pure bash is fragile across terminals; a prompt loop is reliable,
 # degrades cleanly to plain text under NO_COLOR or a non-tty, is trivially
-# scriptable for tests and demos, and never hangs (it exits at stdin EOF). The
-# live digest is re-rendered each loop, which is the "pane" the captain reads.
+# scriptable for tests and demos, and never hangs (it exits at stdin EOF; every
+# flag parse rejects a missing value instead of looping). The live digest is
+# re-rendered each loop, which is the "pane" the captain reads.
+#
+# Validation before a write (also re-checked by the drain, since files can arrive
+# without the console): the task must exist (a live meta), the action must be in
+# the allowlist, answer/note require a non-empty single-line payload within a size
+# bound, no-payload actions reject a payload, and an `answer` requires the target
+# to be awaiting a decision so a live decision token can be stamped for staleness
+# rejection.
 #
 # Usage:
 #   fm-dock.sh                          interactive control loop (render + submit).
 #   fm-dock.sh status                   render the fleet digest once, then exit.
 #   fm-dock.sh submit --task <id> --action <action> [--payload <text>]
-#             [--intent-id <id>] [--decision-id <token> | --no-decision]
-#                                       headless one-shot: write a single intent
+#             [--intent-id <id>]        headless one-shot: write a single intent
 #                                       and print its id. No TTY needed.
 #   fm-dock.sh -h | --help
 #
 #   action is one of: answer note merge peek interrupt teardown promote archive.
-#   For `answer`, the task's current decision token is stamped automatically
-#   (staleness guard) unless --decision-id or --no-decision is given.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-inbox-lib.sh
 . "$SCRIPT_DIR/fm-inbox-lib.sh"
 STATUS_BIN="$SCRIPT_DIR/fm-fleet-status.sh"
+DOCK_VERSION="fm-dock"
 
 usage() {
   sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'
@@ -70,34 +76,65 @@ inflight_ids() {
     | jq -r '[.sections.needs_you[]?, .sections.at_risk[]?, .sections.running[]?] | .[].id' 2>/dev/null
 }
 
-# Write one intent, auto-stamping the decision token for answers. Echoes the id.
-write_intent() {  # <task> <action> <payload> <intent_id> <decision_id> <want_decision>
-  local task=$1 action=$2 payload=$3 id=$4 decision_id=$5 want_decision=$6
-  fm_inbox_valid_action "$action" || { echo "error: invalid action: $action" >&2; return 2; }
-  [ -n "$id" ] || id=$(fm_inbox_new_id)
-  if [ "$action" = answer ] && [ -z "$decision_id" ] && [ "$want_decision" = true ]; then
-    decision_id=$(fm_inbox_decision_token "$task")
+# Validate a submission and echo an error to stderr on the first failure (return
+# non-zero). Actions requiring a payload: answer, note. Others take none.
+validate_submission() {  # <task> <action> <payload>
+  local task=$1 action=$2 payload=$3
+  if ! fm_inbox_valid_action "$action"; then
+    echo "error: unknown action '$action'" >&2; return 2
   fi
-  fm_inbox_write "$id" "$task" "$action" "$payload" "$decision_id" ""
+  if ! fm_inbox_valid_id "$task"; then
+    echo "error: task id '$task' is not a valid task id" >&2; return 2
+  fi
+  if ! fm_inbox_task_exists "$task"; then
+    echo "error: task '$task' is not a live task in this home (no meta - torn down or never existed)" >&2; return 2
+  fi
+  case "$action" in
+    answer|note)
+      [ -n "$payload" ] || { echo "error: action '$action' requires a payload" >&2; return 2; }
+      case "$payload" in *$'\n'*) echo "error: payload must be a single line (fm-send sends one literal line)" >&2; return 2 ;; esac
+      [ "${#payload}" -le "$FM_INBOX_MAX_PAYLOAD" ] || { echo "error: payload exceeds $FM_INBOX_MAX_PAYLOAD bytes" >&2; return 2; }
+      ;;
+    *)
+      [ -z "$payload" ] || { echo "error: action '$action' takes no payload" >&2; return 2; }
+      ;;
+  esac
+  if [ "$action" = answer ]; then
+    fm_inbox_task_awaiting_decision "$task" \
+      || { echo "error: task '$task' is not awaiting a decision; nothing to answer" >&2; return 2; }
+  fi
+  return 0
+}
+
+# Write one validated intent, auto-stamping the decision token for answers and
+# the console provenance marker. Echoes the id.
+write_intent() {  # <task> <action> <payload> <intent_id>
+  local task=$1 action=$2 payload=$3 id=$4 decision_id=""
+  validate_submission "$task" "$action" "$payload" || return $?
+  [ -n "$id" ] || id=$(fm_inbox_new_id)
+  fm_inbox_valid_id "$id" || { echo "error: invalid --intent-id '$id'" >&2; return 2; }
+  if [ "$action" = answer ]; then
+    decision_id=$(fm_inbox_decision_token "$task")
+    [ -n "$decision_id" ] || { echo "error: task '$task' has no decision token to guard the answer" >&2; return 2; }
+  fi
+  fm_inbox_write "$id" "$task" "$action" "$payload" "$decision_id" "$DOCK_VERSION"
 }
 
 cmd_submit() {
   require_jq
-  local task="" action="" payload="" intent_id="" decision_id="" want_decision=true
+  local task="" action="" payload="" intent_id=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --task) task=${2:-}; shift 2 ;;
-      --action) action=${2:-}; shift 2 ;;
-      --payload) payload=${2:-}; shift 2 ;;
-      --intent-id) intent_id=${2:-}; shift 2 ;;
-      --decision-id) decision_id=${2:-}; shift 2 ;;
-      --no-decision) want_decision=false; shift ;;
+      --task) [ $# -ge 2 ] || { echo "error: --task requires a value" >&2; return 2; }; task=$2; shift 2 ;;
+      --action) [ $# -ge 2 ] || { echo "error: --action requires a value" >&2; return 2; }; action=$2; shift 2 ;;
+      --payload) [ $# -ge 2 ] || { echo "error: --payload requires a value" >&2; return 2; }; payload=$2; shift 2 ;;
+      --intent-id) [ $# -ge 2 ] || { echo "error: --intent-id requires a value" >&2; return 2; }; intent_id=$2; shift 2 ;;
       *) echo "error: unknown submit argument: $1" >&2; return 2 ;;
     esac
   done
   [ -n "$task" ] && [ -n "$action" ] || { echo "usage: fm-dock.sh submit --task <id> --action <action> [--payload <text>]" >&2; return 2; }
   local out
-  out=$(write_intent "$task" "$action" "$payload" "$intent_id" "$decision_id" "$want_decision") || return $?
+  out=$(write_intent "$task" "$action" "$payload" "$intent_id") || return $?
   printf 'queued intent %s (%s for %s)\n' "$out" "$action" "$task"
 }
 
@@ -144,10 +181,10 @@ cmd_interactive() {
     IFS= read -r confirm || break
     case "$confirm" in
       y|Y|yes|YES)
-        if id=$(write_intent "$task" "$action" "$payload" "" "" true); then
+        if id=$(write_intent "$task" "$action" "$payload" ""); then
           printf '%s\n' "$(paint 32 "queued intent $id - firstmate will act on it")"
         else
-          printf '%s\n' "$(paint 31 'failed to queue intent')"
+          printf '%s\n' "$(paint 31 'not queued (see the error above)')"
         fi
         ;;
       *) printf '%s\n' "$(paint 2 'cancelled')" ;;
