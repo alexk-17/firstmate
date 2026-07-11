@@ -16,13 +16,30 @@ DRAIN_LOCK_HELD=false
 # watcher's inbox poll, which enqueues an `inbox` wake when armed. But when no
 # watcher is armed (an empty fleet, or before any task exists) nothing enqueues
 # that wake, so surface any still-pending intent here too - the drain runs at the
-# top of every wake-handling turn and at session start. Printed to STDERR (like
-# the guard banner) so it never pollutes the drained-record stdout stream.
-# Gated on jq and on pending intents actually existing, so it is inert otherwise.
+# top of every wake-handling turn and at session start. It also flags a claim
+# stranded past the reclaim window by a crash between claim and resolve, so a
+# captain command can never sit invisibly. Printed to STDERR (like the guard
+# banner) so it never pollutes the drained-record stdout stream. Gated on jq and
+# on there actually being something to surface, so it is inert otherwise. MUST be
+# called only AFTER the wake-queue lock is released (release_queue_lock below):
+# its inbox scan must not run while a watcher's fm_wake_append blocks on the lock.
 advise_inbox() {
   command -v jq >/dev/null 2>&1 || return 0
-  fm_inbox_has_pending || return 0
-  printf 'INBOX: captain command(s) pending in the Dock inbox; run bin/fm-inbox-drain.sh to claim and execute.\n' >&2
+  if fm_inbox_has_pending; then
+    printf 'INBOX: captain command(s) pending in the Dock inbox; run bin/fm-inbox-drain.sh to claim and execute.\n' >&2
+  fi
+  if fm_inbox_has_stranded_claims "${FM_INBOX_RECLAIM_SECS:-900}"; then
+    printf 'INBOX: a claimed command looks stranded (unresolved past the reclaim window); run bin/fm-inbox-drain.sh to re-surface, or --show to inspect.\n' >&2
+  fi
+}
+
+# Release the wake-queue lock exactly once, so the inbox scan in advise_inbox
+# never holds it. The EXIT-trap cleanup then no-ops its own release.
+release_queue_lock() {
+  if [ "$DRAIN_LOCK_HELD" = true ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    DRAIN_LOCK_HELD=false
+  fi
 }
 
 # Defense in depth for the supervision chain: this script runs at the top of
@@ -62,6 +79,7 @@ DRAIN_LOCK_HELD=true
 if [ ! -s "$FM_WAKE_QUEUE" ]; then
   : > "$FM_WAKE_QUEUE"
   assert_watcher_liveness
+  release_queue_lock
   advise_inbox
   exit 0
 fi
@@ -75,5 +93,6 @@ fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
 assert_watcher_liveness
+release_queue_lock
 advise_inbox
 exit 0
