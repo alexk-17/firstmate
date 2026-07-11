@@ -439,6 +439,12 @@ classify_check() {  # <full reason>  — check scripts print only when firstmate
   printf 'escalate|%s' "$1"
 }
 
+# A Dock inbox wake is an explicit captain command; always escalate so it reaches
+# the captain even while away (never self-handled), like a check.
+classify_inbox() {  # <full reason>
+  printf 'escalate|%s' "$1"
+}
+
 classify_heartbeat() {
   # The wake itself is routine; the catch-all scan runs separately in
   # housekeeping on the HEARTBEAT_SCAN_SECS cadence.
@@ -1205,7 +1211,7 @@ should_force_self() {  # <reason>
 is_wake_reason() {  # <reason>
   local reason=$1
   case "$reason" in
-    signal:*|stale:*|check:*|heartbeat|heartbeat:*) return 0 ;;
+    signal:*|stale:*|check:*|inbox:*|heartbeat|heartbeat:*) return 0 ;;
   esac
   return 1
 }
@@ -1225,6 +1231,7 @@ handle_wake() {  # <reason> <state>
     stale:*)  kind=stale; arg="${reason#stale: }"
               decision=$(classify_stale "$arg" "$state") ;;
     check:*)  decision=$(classify_check "$reason") ;;
+    inbox:*)  decision=$(classify_inbox "$reason") ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
     *)        decision=$(classify_unknown "$reason") ;;
   esac

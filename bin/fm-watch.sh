@@ -32,6 +32,9 @@
 #                          closer look instead of another routine supervision
 #                          resume. Unless afk is active.
 #   check: <script>: <out> per-task check output, always actionable
+#   inbox: <note>          a new pending captain command landed in the Dock inbox
+#                          (state/captain-inbox); always actionable - firstmate
+#                          runs bin/fm-inbox-drain.sh to claim and execute it
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
 # For normal supervision, resume the session-start primary-harness protocol
@@ -61,6 +64,11 @@ mkdir -p "$STATE"
 # see bin/fm-backend.sh and docs/herdr-backend.md.
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# The captain command inbox (bin/fm-dock.sh writes intents here). Sourced for its
+# schema accessors so the poll below can read an intent's status through the one
+# owner of the format. Source is side-effect-free: it never creates the inbox dir.
+# shellcheck source=bin/fm-inbox-lib.sh
+. "$SCRIPT_DIR/fm-inbox-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -507,6 +515,38 @@ while :; do
       fi
     done
     touch "$STATE/.last-check"
+  fi
+
+  # Captain command inbox: a new pending intent written by the Dock console
+  # (bin/fm-dock.sh) is an explicit, always-actionable captain command, so it is
+  # polled alongside checks/signals rather than folded into any of their triage.
+  # A per-intent size:mtime marker (.seen-inbox-<id>) means an already-surfaced
+  # pending intent is not re-enqueued every poll. Each NEW pending intent is
+  # enqueued as its own durable `inbox` record (keyed by intent_id, so the queue
+  # de-dupes per intent) BEFORE its marker advances - the same enqueue-before-
+  # suppress ordering the rest of the watcher keeps, so a watcher killed between
+  # the two never swallows a captain command. firstmate then runs
+  # bin/fm-inbox-drain.sh to claim, execute via the existing per-action helper,
+  # and resolve each one. Evaluated before the signal scan so a captain command is
+  # never starved by a chatty crewmate's signals. Inert without jq (the whole
+  # inbox is jq-backed) and without the inbox dir.
+  if [ -d "$STATE/captain-inbox" ] && command -v jq >/dev/null 2>&1; then
+    inbox_pending=false
+    for intent in "$STATE"/captain-inbox/*.json; do
+      [ -e "$intent" ] || continue
+      [ "$(fm_inbox_field "$intent" status 2>/dev/null || true)" = pending ] || continue
+      isig=$(stat_sig "$intent") || continue
+      iid=$(basename "$intent" .json)
+      ikey=$(printf '%s' "$iid" | tr -c 'A-Za-z0-9' '_')
+      isf="$STATE/.seen-inbox-$ikey"
+      [ "$isig" = "$(cat "$isf" 2>/dev/null || true)" ] && continue
+      fm_wake_append inbox "$iid" "inbox: $iid" || exit 1
+      printf '%s' "$isig" > "$isf"
+      inbox_pending=true
+    done
+    if [ "$inbox_pending" = true ]; then
+      wake "inbox: captain command(s) pending - run fm-inbox-drain.sh"
+    fi
   fi
 
   # On the first changed signal, linger one grace period and re-scan before

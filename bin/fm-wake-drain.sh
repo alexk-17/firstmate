@@ -5,9 +5,25 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# Captain command inbox accessors, for the turn-start fallback below.
+# shellcheck source=bin/fm-inbox-lib.sh
+. "$SCRIPT_DIR/fm-inbox-lib.sh"
 
 DRAIN_TMP=
 DRAIN_LOCK_HELD=false
+
+# Turn-start fallback for the captain command inbox. The live path is the
+# watcher's inbox poll, which enqueues an `inbox` wake when armed. But when no
+# watcher is armed (an empty fleet, or before any task exists) nothing enqueues
+# that wake, so surface any still-pending intent here too - the drain runs at the
+# top of every wake-handling turn and at session start. Printed to STDERR (like
+# the guard banner) so it never pollutes the drained-record stdout stream.
+# Gated on jq and on pending intents actually existing, so it is inert otherwise.
+advise_inbox() {
+  command -v jq >/dev/null 2>&1 || return 0
+  fm_inbox_has_pending || return 0
+  printf 'INBOX: captain command(s) pending in the Dock inbox; run bin/fm-inbox-drain.sh to claim and execute.\n' >&2
+}
 
 # Defense in depth for the supervision chain: this script runs at the top of
 # every wake-handling and recovery turn, so assert watcher liveness here too. A
@@ -46,6 +62,7 @@ DRAIN_LOCK_HELD=true
 if [ ! -s "$FM_WAKE_QUEUE" ]; then
   : > "$FM_WAKE_QUEUE"
   assert_watcher_liveness
+  advise_inbox
   exit 0
 fi
 
@@ -58,4 +75,5 @@ fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
 assert_watcher_liveness
+advise_inbox
 exit 0
