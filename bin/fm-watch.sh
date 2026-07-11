@@ -520,29 +520,48 @@ while :; do
   # Captain command inbox: a new pending intent written by the Dock console
   # (bin/fm-dock.sh) is an explicit, always-actionable captain command, so it is
   # polled alongside checks/signals rather than folded into any of their triage.
-  # A per-intent size:mtime marker (.seen-inbox-<id>) means an already-surfaced
-  # pending intent is not re-enqueued every poll. Each NEW pending intent is
-  # enqueued as its own durable `inbox` record (keyed by intent_id, so the queue
-  # de-dupes per intent) BEFORE its marker advances - the same enqueue-before-
-  # suppress ordering the rest of the watcher keeps, so a watcher killed between
-  # the two never swallows a captain command. firstmate then runs
-  # bin/fm-inbox-drain.sh to claim, execute via the existing per-action helper,
-  # and resolve each one. Evaluated before the signal scan so a captain command is
-  # never starved by a chatty crewmate's signals. Inert without jq (the whole
-  # inbox is jq-backed) and without the inbox dir.
+  # This poll is strictly BOUNDED so it can never starve the supervision backbone
+  # (the beacon was already touched at the top of this cycle):
+  #   - the collision-free per-intent size:mtime marker (fm_inbox_seen_marker)
+  #     is checked with a cheap stat FIRST, so an unchanged file costs no jq;
+  #   - an oversized file is skipped by its size gate without a semantic parse;
+  #   - at most FM_INBOX_MAX_PER_POLL changed files are examined per cycle, so a
+  #     flood or a large valid file cannot monopolize a poll - the rest are seen
+  #     next cycle. Resolved intents move to done/ (out of this glob), so the
+  #     steady-state set is only the genuinely in-flight commands.
+  # Each NEW pending intent is enqueued as its own durable `inbox` record (keyed
+  # by intent_id, so the queue de-dupes per intent) BEFORE its marker advances -
+  # the enqueue-before-suppress ordering the rest of the watcher keeps, so a
+  # watcher killed between the two never swallows a captain command. firstmate
+  # then runs bin/fm-inbox-drain.sh to claim, execute, and resolve each one.
+  # Inert without jq (the whole inbox is jq-backed) and without the inbox dir.
   if [ -d "$STATE/captain-inbox" ] && command -v jq >/dev/null 2>&1; then
     inbox_pending=false
+    inbox_examined=0
+    inbox_budget=${FM_INBOX_MAX_PER_POLL:-25}
     for intent in "$STATE"/captain-inbox/*.json; do
       [ -e "$intent" ] || continue
-      [ "$(fm_inbox_field "$intent" status 2>/dev/null || true)" = pending ] || continue
       isig=$(stat_sig "$intent") || continue
       iid=$(basename "$intent" .json)
-      ikey=$(printf '%s' "$iid" | tr -c 'A-Za-z0-9' '_')
-      isf="$STATE/.seen-inbox-$ikey"
+      isf=$(fm_inbox_seen_marker "$iid")
+      # Unchanged since last examined: skip with no jq/parse cost.
       [ "$isig" = "$(cat "$isf" 2>/dev/null || true)" ] && continue
-      fm_wake_append inbox "$iid" "inbox: $iid" || exit 1
-      printf '%s' "$isig" > "$isf"
-      inbox_pending=true
+      # Bound per-poll work: stop examining new/changed files past the budget;
+      # the unmarked remainder is picked up on the next cycle.
+      [ "$inbox_examined" -ge "$inbox_budget" ] && break
+      inbox_examined=$((inbox_examined + 1))
+      # Validate strictly (also enforces the size cap and filename-stem==intent_id)
+      # and read the status in one jq. Invalid/oversized -> mark seen so it is not
+      # re-parsed every poll, and skip.
+      istatus=$(fm_inbox_validate_and_status "$intent") || { printf '%s' "$isig" > "$isf"; continue; }
+      if [ "$istatus" = pending ]; then
+        fm_wake_append inbox "$iid" "inbox: $iid" || exit 1
+        printf '%s' "$isig" > "$isf"
+        inbox_pending=true
+      else
+        # Claimed/terminal: mark seen so the next poll skips the jq for this state.
+        printf '%s' "$isig" > "$isf"
+      fi
     done
     if [ "$inbox_pending" = true ]; then
       wake "inbox: captain command(s) pending - run fm-inbox-drain.sh"
