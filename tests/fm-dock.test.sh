@@ -8,6 +8,11 @@
 # requires a live decision gate, unknown tasks and malformed submissions are
 # rejected, a trailing flag does NOT hang (the reproduced infinite loop), and the
 # interactive loop writes on confirm, skips on cancel, and always exits cleanly.
+#
+# The full-screen TUI is layered strictly ON TOP of these paths. The regression
+# tests at the end pin that the non-TUI surface is UNCHANGED: --plain forces the
+# original picker, a non-tty invocation (default or --tui) falls back to the same
+# picker and never hangs, and submit/status behave byte-for-byte as before.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -201,6 +206,64 @@ test_help_and_status_are_readonly() {
   pass "--help and status are read-only"
 }
 
+# --- additive-layer regression guard ---------------------------------------
+# The TUI must not change any non-TUI behavior. These prove the default/forced
+# non-tty surface is exactly the original picker.
+
+test_plain_flag_uses_picker() {
+  local home count
+  home=$(new_home plain-picker)
+  register_task "$home" fix-login-k3
+  printf 'fix-login-k3\nnote\nrebase please\ny\nq\n' | dock "$home" --plain >/dev/null 2>&1 \
+    || fail "--plain picker exited non-zero"
+  count=$(json_count "$home/state/captain-inbox")
+  [ "$count" = 1 ] || fail "--plain must drive the original picker (expected 1 intent, got $count)"
+  jq -e '.action == "note" and .task_id == "fix-login-k3" and .payload == "rebase please"' \
+    "$home/state/captain-inbox"/*.json >/dev/null || fail "--plain picker intent has wrong fields"
+  pass "--plain forces the original picker loop unchanged"
+}
+
+test_default_nontty_uses_picker() {
+  local home count
+  home=$(new_home default-nontty)
+  register_task "$home" fix-login-k3
+  # No subcommand, piped (non-tty) stdin: must fall to the picker, not the TUI.
+  printf 'fix-login-k3\nnote\nrebase please\ny\nq\n' | dock "$home" >/dev/null 2>&1 \
+    || fail "default non-tty dock exited non-zero"
+  count=$(json_count "$home/state/captain-inbox")
+  [ "$count" = 1 ] || fail "default on a non-tty must use the picker (expected 1 intent, got $count)"
+  pass "default interactive on a non-tty is the picker, byte-for-byte as before"
+}
+
+test_tui_flag_falls_back_when_no_tty() {
+  local home count rc
+  home=$(new_home tui-fallback)
+  register_task "$home" fix-login-k3
+  # --tui with no real tty must degrade to the picker AND never hang.
+  run_bounded 5 bash -c '
+    printf "fix-login-k3\nnote\nrebase please\ny\nq\n" \
+      | env FM_HOME="'"$home"'" FM_STATE_OVERRIDE="'"$home"'/state" NO_COLOR=1 "'"$DOCK"'" --tui >/dev/null 2>&1'
+  rc=$?
+  [ "$rc" -ne 124 ] || fail "--tui without a tty HUNG instead of falling back"
+  count=$(json_count "$home/state/captain-inbox")
+  [ "$count" = 1 ] || fail "--tui without a tty must fall back to the picker (expected 1 intent, got $count)"
+  pass "--tui degrades to the picker without a tty and never hangs"
+}
+
+test_status_output_unchanged() {
+  local home out
+  home=$(new_home status-unchanged)
+  register_task "$home" fix-login-k3 "working: implementing"
+  # status still renders the read-only digest and writes nothing - the sourcing
+  # of the TUI lib must not perturb it.
+  out=$(dock "$home" status) || fail "status exited non-zero"
+  assert_contains "$out" "NEEDS YOU" "status must still render the fleet digest"
+  assert_contains "$out" "RUNNING" "status must still render every digest section"
+  [ ! -d "$home/state/captain-inbox" ] || [ "$(json_count "$home/state/captain-inbox")" = 0 ] \
+    || fail "status must remain read-only under the TUI layer"
+  pass "status subcommand output is unchanged and read-only under the TUI layer"
+}
+
 test_submit_writes_intent
 test_submit_answer_stamps_decision_token
 test_submit_answer_requires_decision_gate
@@ -212,3 +275,7 @@ test_interactive_writes_on_confirm
 test_interactive_cancel_writes_nothing
 test_interactive_exits_on_eof
 test_help_and_status_are_readonly
+test_plain_flag_uses_picker
+test_default_nontty_uses_picker
+test_tui_flag_falls_back_when_no_tty
+test_status_output_unchanged
