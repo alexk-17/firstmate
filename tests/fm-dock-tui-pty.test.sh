@@ -13,6 +13,12 @@
 #      not be swallowed as a refresh timeout.
 #   3. An empty-but-present NO_COLOR= on a real tty must fall back to the plain
 #      picker, never the full-screen TUI (NO_COLOR presence, not value).
+#   4. Arrow-key navigation (ESC [ B) decodes and moves the selection. This guards
+#      the decode + move-selection dispatch. It does NOT reproduce the interactive
+#      echo-leak that motivated the session's -icanon -echo mode: that leak is
+#      keystroke-timing-dependent (input arriving during a render gap, echoed by a
+#      canonical terminal) and a scripted burst can't simulate it - it is verified
+#      live. Kept because a broken decode/dispatch WOULD fail here.
 #
 # It also confirms the alternate screen is entered and left (terminal never
 # wedged) on a normal quit. python3 drives the pty; the suite skips without it.
@@ -157,8 +163,38 @@ ok(not any(s in buf for s in SMCUP),
 ok(not alive and code == 0, "the NO_COLOR= picker exits cleanly and never hangs (got %r)" % code)
 shutil.rmtree(home, ignore_errors=True)
 
+# --- 4. arrow-key navigation moves the selection ------------------------------
+def two_task_home():
+    h = tempfile.mkdtemp(prefix="fm-dock-pty.")
+    s = os.path.join(h, "state"); os.makedirs(s)
+    for tid, proj in (("task-a1", "alpha"), ("task-b2", "beta")):
+        with open(os.path.join(s, tid + ".meta"), "w") as f:
+            f.write("window=x:fm-%s\nkind=ship\nharness=claude\nmode=no-mistakes\nproject=%s\n" % (tid, proj))
+        with open(os.path.join(s, tid + ".status"), "w") as f:
+            f.write("working: implementing\n")
+    return h, s
+
+def peeked_task(arrow_down):
+    h, s = two_task_home()
+    p, f = spawn(["--tui"], h, s)
+    pump(f, 2.0)
+    if arrow_down:
+        os.write(f, b"\x1b[B"); pump(f, 0.6)   # arrow-down: move the selection
+    os.write(f, b"p"); pump(f, 0.6)            # peek the selected task (no payload)
+    os.write(f, b"q")
+    finish(p, f)
+    pk = [i for i in intents(s) if i.get("action") == "peek"]
+    tid = pk[0]["task_id"] if pk else None
+    shutil.rmtree(h, ignore_errors=True)
+    return tid
+
+t0 = peeked_task(False)   # peek at sel=0
+t1 = peeked_task(True)    # arrow-down, then peek at sel=1
+ok(t0 is not None and t1 is not None, "peek queued in both nav runs (got %r, %r)" % (t0, t1))
+ok(t0 != t1, "arrow-down moves the selection to a different task (%r -> %r)" % (t0, t1))
+
 sys.exit(1 if failed else 0)
 PY
 rc=$?
 [ "$rc" -eq 0 ] || fail "pty integration checks failed (see the not-ok lines above)"
-pass "pty integration: payload bytes clean, Ctrl-D/EOF exits, NO_COLOR= falls back to the picker"
+pass "pty integration: payload bytes clean, Ctrl-D/EOF exits, NO_COLOR= falls back to the picker, arrow keys navigate"

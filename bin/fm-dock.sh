@@ -313,7 +313,13 @@ tui_prompt() {  # <prompt>  -> stdout: the entered line only
   local line rows
   rows=$(tput lines 2>/dev/null) || rows=24
   { tput cnorm; tput cup "$((rows - 1))" 0; printf '\033[2K%s' "$1"; } >/dev/tty 2>/dev/null || true
+  # The session runs in -icanon -echo (cmd_tui); restore cooked+echo just for this
+  # line entry so the captain sees and can edit what they type, then return to the
+  # char-at-a-time mode the key loop needs. stty writes to /dev/tty only, so the
+  # captured stdout stays exactly the entered line (payload-contamination fix).
+  stty icanon echo </dev/tty 2>/dev/null || true
   IFS= read -r line </dev/tty || line=""
+  stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null || true
   tput civis >/dev/tty 2>/dev/null || true
   printf '%s' "$line"
 }
@@ -361,6 +367,12 @@ cmd_tui() {
   trap ':' WINCH
   tput smcup 2>/dev/null || true
   tput civis 2>/dev/null || true
+  # Put the terminal in char-at-a-time, no-echo mode for the whole TUI session.
+  # Relying on per-read `-s`/`-n` alone left echo-and-line-buffer gaps (notably
+  # across the auto-refresh window) where arrow-key bytes leaked to the screen as
+  # literal input instead of moving the selection. tui_teardown restores the
+  # saved stty on every exit path; tui_prompt restores cooked mode for line entry.
+  stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null || true
 
   local view=list sel=0 sel_id="" status_json inbox_json cols rowsn stamp count screen
   local key rest rc before
@@ -409,8 +421,10 @@ cmd_tui() {
     if [ "$key" = $'\033' ]; then
       rest=""
       IFS= read -rsn2 -t 1 rest
+      # CSI (ESC [ A) and SS3 (ESC O A, "application cursor keys" mode) both occur.
       case "$rest" in
-        '[A') key=up ;; '[B') key=down ;; '[C') key=right ;; '[D') key=left ;;
+        '[A'|'OA') key=up ;;   '[B'|'OB') key=down ;;
+        '[C'|'OC') key=right ;; '[D'|'OD') key=left ;;
         *) key=esc ;;
       esac
     fi
