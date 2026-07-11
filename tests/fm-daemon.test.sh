@@ -118,11 +118,13 @@ test_classify_check_and_unknown_escalate() {
   local out
   out=$(classify_check "check: /s/c.check.sh: merged: https://x")
   case "$out" in escalate\|*) ;; *) fail "check did not escalate: $out" ;; esac
+  out=$(classify_inbox "inbox: captain command(s) pending")
+  case "$out" in escalate\|*) ;; *) fail "inbox did not escalate (a captain command must reach the captain in afk): $out" ;; esac
   out=$(classify_unknown "frobnicate: weird")
   case "$out" in escalate\|*) ;; *) fail "unknown did not fail-safe escalate: $out" ;; esac
   out=$(classify_heartbeat)
   case "$out" in self\|*) ;; *) fail "heartbeat did not self-handle: $out" ;; esac
-  pass "check + unknown escalate; heartbeat self-handles"
+  pass "check + inbox + unknown escalate; heartbeat self-handles"
 }
 
 test_stale_transient_self_records_marker() {
@@ -602,6 +604,7 @@ test_is_wake_reason_distinguishes_status_stdout() {
   is_wake_reason "signal: /x/y.status" || fail "signal: not recognized as wake"
   is_wake_reason "stale: s:fm-x" || fail "stale: not recognized as wake"
   is_wake_reason "check: /s/c.sh: merged" || fail "check: not recognized as wake"
+  is_wake_reason "inbox: captain command(s) pending" || fail "inbox: not recognized as wake"
   is_wake_reason "heartbeat" || fail "heartbeat not recognized as wake"
   is_wake_reason "watcher: already running" && fail "singleton status line misclassified as wake"
   is_wake_reason "watcher: already running pid 123" && fail "singleton status (pid) misclassified as wake"

@@ -8,14 +8,17 @@
 #   1. fm-dock.sh writes a `note` intent for a (fake) in-flight task
 #   2. the watcher notices the pending intent and surfaces an `inbox` wake
 #   3. fm-wake-drain.sh shows the durable inbox record firstmate would wake on
-#   4. fm-inbox-drain.sh surfaces one actionable record and claims the intent
-#   5. firstmate would now execute it via the EXISTING helper (fm-send for a
-#      note) - simulated here, because the point is the control plane, not a
-#      real crewmate - then records the outcome with --resolve
-#   6. the Dock reflects the intent as done
+#   4. fm-inbox-drain.sh surfaces one actionable record and CAS-claims the intent
+#   5. firstmate executes it via the REAL dispatcher (fm-inbox-drain.sh --execute)
+#      which calls the existing helper (fm-send.sh, faked here with a recorder) -
+#      we assert the exact task/payload transport and that the intent resolves
+#      done by the helper's exit status
+#   6. the intent lands in done/ and no pending remain
 #
 # The console never touched a crewmate: it only wrote an intent, and firstmate
-# (here, this script standing in for it) is the sole executor.
+# (here, this script standing in for it) is the sole executor. fm-send is faked
+# so the round-trip needs no live crewmate, but the SAME dispatcher firstmate
+# uses is exercised - a broken action-to-helper dispatch would fail this.
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -36,11 +39,20 @@ state="$dir/state"
 fakebin="$dir/fakebin"
 export FM_HOME="$dir" FM_STATE_OVERRIDE="$state"
 
-# A fake in-flight task the note targets (a meta + a status line), so the round
-# trip mirrors a real ship task without spawning anything.
+# A fake in-flight task the note targets (a meta the Dock's existence check needs,
+# plus a status line), so the round trip mirrors a real ship task.
 TASK="fix-login-k3"
 printf 'window=dock-e2e:fm-%s\nkind=ship\n' "$TASK" > "$state/$TASK.meta"
 printf 'working: implementing\n' > "$state/$TASK.status"
+
+# A fake fm-send recorder standing in for the real backend helper.
+SEND_LOG="$dir/send.log"
+cat > "$dir/fake-send.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s|%s\n' "${1:-}" "${2:-}" >> "$FM_SEND_LOG"
+exit 0
+SH
+chmod +x "$dir/fake-send.sh"
 
 say "STEP 1 - captain submits a note via the Dock console (write-only)"
 out=$(FM_HOME="$dir" FM_STATE_OVERRIDE="$state" NO_COLOR=1 "$DOCK" submit \
@@ -65,7 +77,7 @@ printf '    %s\n' "$wake_out"
 printf '%s' "$wake_out" | grep "$(printf '\tinbox\t')" | grep -F "$iid" >/dev/null \
   || fail "e2e: the inbox wake was not queued as a durable record"
 
-say "STEP 4 - fm-inbox-drain.sh surfaces one actionable record and claims it"
+say "STEP 4 - fm-inbox-drain.sh surfaces one actionable record and CAS-claims it"
 record=$(FM_STATE_OVERRIDE="$state" "$INBOX_DRAIN")
 printf '    %s\n' "$record"
 printf '%s' "$record" | jq -e --arg id "$iid" '.intent_id == $id and .action == "note"' >/dev/null \
@@ -73,19 +85,19 @@ printf '%s' "$record" | jq -e --arg id "$iid" '.intent_id == $id and .action == 
 [ "$(jq -r '.status' "$state/captain-inbox/$iid.json")" = claimed ] \
   || fail "e2e: drain did not claim the intent"
 
-say "STEP 5 - firstmate executes it via the existing helper (fm-send), then resolves"
-task_id=$(printf '%s' "$record" | jq -r '.task_id')
-payload=$(printf '%s' "$record" | jq -r '.payload')
-printf "    (firstmate would run: FM_HOME=%s bin/fm-send.sh %s '%s')\n" "$dir" "$task_id" "$payload"
-FM_STATE_OVERRIDE="$state" "$INBOX_DRAIN" --resolve "$iid" "done" "note relayed to $task_id via fm-send"
+say "STEP 5 - firstmate executes it via the REAL dispatcher (fm-inbox-drain --execute)"
+FM_STATE_OVERRIDE="$state" FM_SEND_LOG="$SEND_LOG" FM_INBOX_SEND_BIN="$dir/fake-send.sh" \
+  "$INBOX_DRAIN" --execute "$iid" || fail "e2e: --execute failed"
+printf '    fm-send received: %s\n' "$(cat "$SEND_LOG")"
+[ "$(cat "$SEND_LOG")" = "$TASK|please rebase onto main before CI" ] \
+  || fail "e2e: the dispatcher did not transport the exact task/payload to fm-send"
 
-say "STEP 6 - the Dock reflects the intent as done"
+say "STEP 6 - the intent is resolved done, moved to done/, and nothing remains pending"
 FM_STATE_OVERRIDE="$state" "$INBOX_DRAIN" --show "$iid" | jq -c '{intent_id, status, result}'
-[ "$(jq -r '.status' "$state/captain-inbox/$iid.json")" = "done" ] \
-  || fail "e2e: the intent was not marked done after resolve"
-
-say "STEP 7 - no pending intents remain"
+[ "$(jq -r '.status' "$state/captain-inbox/done/$iid.json")" = "done" ] \
+  || fail "e2e: the intent was not resolved done in done/"
+[ ! -f "$state/captain-inbox/$iid.json" ] || fail "e2e: the resolved intent should leave the top-level dir"
 [ -z "$(FM_STATE_OVERRIDE="$state" "$INBOX_DRAIN" --list)" ] \
   || fail "e2e: an intent is still pending after the round-trip"
 
-pass "e2e round-trip: dock -> watcher inbox wake -> drain/claim -> resolve -> done"
+pass "e2e round-trip: dock -> watcher inbox wake -> drain/claim -> execute via fm-send -> done"

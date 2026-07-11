@@ -229,8 +229,35 @@ test_drain_asserts_watcher_liveness() {
   pass "drain asserts watcher liveness: warns on a lapse, stays silent right after a fire"
 }
 
+# The drain surfaces the Dock inbox as a turn-start fallback (for when no watcher
+# is armed), on STDERR so the drained-record stdout stream is never polluted. A
+# pending intent AND a crash-stranded claim are both flagged; the inbox scan runs
+# only AFTER the wake-queue lock is released.
+test_drain_advises_inbox_on_stderr() {
+  local dir state err out
+  command -v jq >/dev/null 2>&1 || { pass "drain inbox advisory: skipped (jq not found)"; return; }
+  dir=$(make_case drain-inbox-advisory)
+  state="$dir/state"
+  err="$dir/drain.err"
+  out="$dir/drain.out"
+  # No pending intent: no advisory, clean stderr.
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || fail "drain failed on empty inbox"
+  ! grep -F 'INBOX:' "$err" >/dev/null || fail "drain advised an inbox with nothing pending"
+  # A pending intent: advisory on stderr, stdout still empty (no wake records).
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_inbox_write adv-1 taskA note "steer" "" "" >/dev/null' _ "$ROOT/bin/fm-inbox-lib.sh"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" 2> "$err" || fail "drain failed with a pending intent"
+  grep -F 'INBOX: captain command(s) pending' "$err" >/dev/null || fail "drain did not advise the pending inbox intent on stderr"
+  [ ! -s "$out" ] || fail "drain must not print the inbox advisory to stdout (record stream)"
+  # A stranded claim (RECLAIM_SECS=0): advisory flags it too.
+  FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-inbox-drain.sh" >/dev/null 2>&1   # claim adv-1
+  FM_STATE_OVERRIDE="$state" FM_INBOX_RECLAIM_SECS=0 "$DRAIN" >/dev/null 2> "$err" || fail "drain failed with a stranded claim"
+  grep -F 'INBOX: a claimed command looks stranded' "$err" >/dev/null || fail "drain did not flag the stranded claim"
+  pass "drain advises pending and stranded inbox intents on stderr only"
+}
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
+test_drain_advises_inbox_on_stderr
 test_stale_enqueue_before_suppressor
 test_not_working_stale_enqueue_before_suppressor
 test_check_output_is_queued

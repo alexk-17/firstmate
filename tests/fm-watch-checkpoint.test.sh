@@ -64,6 +64,28 @@ SH
   pass "checkpoint preserves watcher environment for the foreground fm-watch.sh"
 }
 
+# Regression for the Dock control layer (B1/N4): a pending inbox intent makes the
+# checkpoint's foreground watcher exit `inbox:`, which the checkpoint's wake regex
+# must recognize and pass through with exit 0.
+test_inbox_wake_passes_through_and_exits_zero() {
+  local home out err status drained
+  command -v jq >/dev/null 2>&1 || { pass "checkpoint inbox wake: skipped (jq not found)"; return; }
+  home=$(make_home inbox)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  (
+    sleep 1
+    FM_HOME="$home" bash -c '. "$1"; fm_inbox_write cp-inbox-1 taskA note "steer" "" "" >/dev/null' _ "$ROOT/bin/fm-inbox-lib.sh"
+  ) &
+  status=0
+  FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 8 >"$out" 2>"$err" || status=$?
+  expect_code 0 "$status" "inbox checkpoint exit"
+  assert_contains "$(cat "$out")" "inbox:" "inbox wake was not passed through"
+  drained=$(FM_HOME="$home" "$ROOT/bin/fm-wake-drain.sh" 2>/dev/null)
+  assert_contains "$drained" $'\tinbox\t' "inbox wake was not queued durably"
+  pass "checkpoint passes through an inbox wake and leaves the queue for drain"
+}
+
 test_existing_singleton_watcher_is_not_success() {
   local home out err status
   home=$(make_home singleton)
@@ -82,4 +104,5 @@ test_existing_singleton_watcher_is_not_success() {
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
+test_inbox_wake_passes_through_and_exits_zero
 test_existing_singleton_watcher_is_not_success

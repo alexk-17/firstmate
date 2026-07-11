@@ -611,6 +611,30 @@ SH
   pass "arm propagates an immediate watcher wake before confirmation"
 }
 
+# Regression for the Dock control layer (B1): a pending inbox intent at arm time
+# makes the fresh watcher's first cycle exit `inbox:` before the confirm poll
+# sees it healthy. The arm's wake regex must recognize `inbox:` or it discards
+# the wake, spins to CONFIRM_TIMEOUT, and falsely reports FAILED with work in
+# flight - the twin of the check-wake case above.
+test_arm_propagates_inbox_wake_before_confirmation() {
+  local dir state fakebin armout drain_out rc
+  dir=$(make_case arm-inbox-wake)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  drain_out="$dir/drain.out"
+  command -v jq >/dev/null 2>&1 || { pass "arm inbox wake: skipped (jq not found)"; return; }
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_inbox_write arm-inbox-1 taskA note "steer" "" "" >/dev/null' _ "$ROOT/bin/fm-inbox-lib.sh"
+  rc=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=0 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" || rc=$?
+  [ "$rc" -eq 0 ] || fail "arm returned non-zero for an immediate inbox wake (status $rc): $(cat "$armout")"
+  grep -F "inbox:" "$armout" >/dev/null || fail "arm did not propagate the immediate inbox wake"
+  ! grep -qF 'watcher: FAILED' "$armout" || fail "arm printed FAILED after a valid immediate inbox wake"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after immediate inbox arm wake failed"
+  grep "$(printf '\tinbox\t')" "$drain_out" | grep -F "arm-inbox-1" >/dev/null || fail "immediate inbox arm wake was not queued"
+  pass "arm propagates an immediate inbox wake before confirmation"
+}
+
 test_arm_waits_for_peer_beacon_after_child_stands_down() {
   local dir state fakebin armout peer beater identity armpid status i
   dir=$(make_case arm-peer-startup-race)
@@ -723,5 +747,6 @@ test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
+test_arm_propagates_inbox_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
