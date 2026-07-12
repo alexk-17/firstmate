@@ -253,6 +253,25 @@ collect_inbox() {
 build_detail() {  # <id> <status_json>
   local id=$1 sjson=$2 row harness mode project worktree branch csline
   local dec_present=false dec_text="" tail_json
+  # A recently-done task has no live meta (torn down); build its detail from the
+  # RECENTLY DONE digest entry - title, repo, and the artifact (PR url, report
+  # path, or merge note), which is the whole point of viewing it.
+  local drow
+  drow=$(printf '%s' "$sjson" | jq -c --arg id "$id" \
+    '(.sections.recently_done // []) | map(select(.id == $id)) | (.[0] // empty)' 2>/dev/null) || drow=""
+  if [ -n "$drow" ]; then
+    printf '%s' "$drow" | jq --arg id "$id" '{
+      id: $id, project: (.repo // "-"), harness: "-", mode: "-", kind: "done",
+      phase: "done", owner: "-", health: "-", age: "-",
+      pr_url: (if ((.artifact // "") | test("^https?://")) then .artifact else null end),
+      branch: "-", crew_state: "",
+      decision: {present: false, text: ""},
+      status_tail: ([ (.title // empty) ]
+        + (if ((.artifact // "") != "") and (((.artifact // "") | test("^https?://")) | not)
+           then [ .artifact ] else [] end))
+    }' 2>/dev/null || printf '{"id":"%s","phase":"done"}' "$id"
+    return 0
+  fi
   row=$(printf '%s' "$sjson" | jq -c --arg id "$id" \
     '[.sections.needs_you[]?, .sections.at_risk[]?, .sections.running[]?]
      | map(select(.id == $id)) | (.[0] // {})' 2>/dev/null) || row='{}'
@@ -383,7 +402,7 @@ cmd_tui() {
     cols=$(tput cols 2>/dev/null) || cols=80
     rowsn=$(tput lines 2>/dev/null) || rowsn=24
     stamp=$(date +%H:%M:%S)
-    count=$(fm_dock_actionable_count "$status_json")
+    count=$(fm_dock_selectable_count "$status_json")
     sel=$(fm_dock_clamp_sel "$sel" "$count")
     sel_id=$(fm_dock_nth_id "$status_json" "$sel")
 
@@ -436,7 +455,9 @@ cmd_tui() {
       case "$key" in
         q|Q) break ;;
         esc|left) view=list ;;
-        a|n|m|p|i|t) tui_action "$key" "$sel_id" ;;
+        a|n|m|p|i|t)
+          if fm_dock_id_is_actionable "$status_json" "$sel_id"; then tui_action "$key" "$sel_id"
+          else TUI_FLASH="$key: not available for a completed task"; fi ;;
       esac
     else
       case "$key" in
@@ -444,7 +465,9 @@ cmd_tui() {
         up|k) sel=$(fm_dock_move_sel "$sel" "$count" up) ;;
         down|j) sel=$(fm_dock_move_sel "$sel" "$count" down) ;;
         ''|right) [ "$count" -gt 0 ] && view=detail ;;   # Enter opens the detail view
-        a|n|m|p|i|t) tui_action "$key" "$sel_id" ;;
+        a|n|m|p|i|t)
+          if fm_dock_id_is_actionable "$status_json" "$sel_id"; then tui_action "$key" "$sel_id"
+          else TUI_FLASH="$key: not available for a completed task"; fi ;;
       esac
     fi
   done

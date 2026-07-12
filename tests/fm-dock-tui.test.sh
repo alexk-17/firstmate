@@ -44,7 +44,14 @@ test_actionable_order_and_count() {
   [ "$(fm_dock_actionable_count "$EMPTY")" = 0 ] || fail "empty projection must count 0"
   [ "$(fm_dock_nth_id "$SJSON" 1)" = stale-b2 ] || fail "nth_id 1 must be stale-b2"
   [ -z "$(fm_dock_nth_id "$SJSON" 9)" ] || fail "nth_id out of range must be empty"
-  pass "actionable list order, count, and nth match the fleet-status projection"
+  # The cursor also moves over RECENTLY DONE (selectable, for viewing), but a done
+  # task is NOT actionable - no inbox action fires on finished work.
+  [ "$(fm_dock_selectable_count "$SJSON")" = 4 ] || fail "selectable count must be 4 (incl. recently done)"
+  [ "$(fm_dock_selectable_count "$EMPTY")" = 0 ] || fail "empty projection selectable count must be 0"
+  [ "$(fm_dock_nth_id "$SJSON" 3)" = done-d4 ] || fail "nth_id 3 must reach recently-done done-d4"
+  fm_dock_id_is_actionable "$SJSON" decide-a1 || fail "a live task must be actionable"
+  ! fm_dock_id_is_actionable "$SJSON" done-d4 || fail "a recently-done task must NOT be actionable"
+  pass "selection spans all four sections; the actionable subset excludes recently-done"
 }
 
 test_selection_clamp_and_move() {
@@ -100,7 +107,11 @@ test_render_list_structure_and_plain() {
   assert_not_contains "$out" "› decide-a1" "unselected rows carry no cursor marker"
   # plain output carries no ANSI escapes.
   assert_not_contains "$out" "$(printf '\033')" "NO_COLOR/plain render must contain no ANSI escapes"
-  pass "list render is complete and fully plain when color is off"
+  # sel=3 -> the cursor reaches the recently-done row (now selectable for viewing).
+  out=$(fm_dock_render_list "$SJSON" 3 80 40 false "12:00:00" 3 '[]' '')
+  assert_contains "$out" "› done-d4" "the cursor can select a recently-done row"
+  assert_not_contains "$out" "› run-c3" "only the selected (done) row carries the cursor at sel=3"
+  pass "list render is complete and fully plain when color is off; the cursor reaches recently-done"
 }
 
 test_render_list_color_and_flash_and_inbox() {

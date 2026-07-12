@@ -15,11 +15,13 @@
 #                 JSON projection (+ inbox array, selection index, terminal
 #                 width AND height, color, clock stamp, flash) into the exact
 #                 screen string, width-clipped and height-bounded to a viewport.
-#   selection     fm_dock_actionable_ids / _count / _nth_id / _clamp_sel /
-#                 _move_sel are the cursor state machine over the actionable list
-#                 (NEEDS YOU ++ AT RISK ++ RUNNING, in that fixed order - the same
-#                 order and projection bin/fm-fleet-status.sh emits; never
-#                 re-derived).
+#   selection     fm_dock_selectable_ids / _selectable_count / _nth_id /
+#                 _clamp_sel / _move_sel are the cursor state machine. The cursor
+#                 moves over NEEDS YOU ++ AT RISK ++ RUNNING ++ RECENTLY DONE, in
+#                 that fixed fm-fleet-status.sh order (never re-derived).
+#                 fm_dock_actionable_ids / _count / _id_is_actionable are the LIVE
+#                 subset (no RECENTLY DONE): a done row is selectable only to view
+#                 its detail, and the loop refuses inbox actions on it.
 #   dispatch      fm_dock_action_for_key maps a single keystroke to an inbox
 #                 action; _action_needs_payload / _action_is_destructive gate the
 #                 payload prompt and the destructive-confirm modal.
@@ -32,12 +34,27 @@
 
 # --- selection state machine (pure) ----------------------------------------
 
-# The actionable task ids, in cursor order: NEEDS YOU, then AT RISK, then
-# RUNNING - identical to fm-fleet-status.sh's projection order (RECENTLY DONE is
-# not actionable and is never included).
+# The ACTIONABLE task ids (live work that can take an inbox action), in order:
+# NEEDS YOU, then AT RISK, then RUNNING. RECENTLY DONE is NOT actionable (finished
+# work takes no answer/note/merge/peek/interrupt/teardown) and is excluded here;
+# it is selectable for VIEWING via fm_dock_selectable_ids below.
 fm_dock_actionable_ids() {  # <status_json>
   printf '%s' "$1" \
     | jq -r '[.sections.needs_you[]?, .sections.at_risk[]?, .sections.running[]?] | .[].id' 2>/dev/null
+}
+
+# The SELECTABLE task ids - the cursor set the arrow keys move over: the
+# actionable set PLUS RECENTLY DONE appended last, matching the on-screen order.
+fm_dock_selectable_ids() {  # <status_json>
+  printf '%s' "$1" \
+    | jq -r '[.sections.needs_you[]?, .sections.at_risk[]?, .sections.running[]?, .sections.recently_done[]?] | .[].id' 2>/dev/null
+}
+
+# 0 iff <id> is an actionable (live) task; non-zero for a recently-done id. The
+# loop allows detail/view on any selected row but refuses inbox actions on a
+# completed task.
+fm_dock_id_is_actionable() {  # <status_json> <id>
+  fm_dock_actionable_ids "$1" | grep -qxF "$2"
 }
 
 fm_dock_actionable_count() {  # <status_json>
@@ -46,11 +63,19 @@ fm_dock_actionable_count() {  # <status_json>
   printf '%s' "${n:-0}"
 }
 
-# The id at cursor <index> (0-based), or nothing when out of range.
+# Count of the SELECTABLE set (the 4 sections) - the cursor's range.
+fm_dock_selectable_count() {  # <status_json>
+  local n
+  n=$(fm_dock_selectable_ids "$1" | grep -c . 2>/dev/null)
+  printf '%s' "${n:-0}"
+}
+
+# The id at cursor <index> (0-based) over the SELECTABLE set, or nothing when out
+# of range.
 fm_dock_nth_id() {  # <status_json> <index>
   local idx=$2
   case "$idx" in ''|*[!0-9]*) return 1 ;; esac
-  fm_dock_actionable_ids "$1" | sed -n "$((idx + 1))p"
+  fm_dock_selectable_ids "$1" | sed -n "$((idx + 1))p"
 }
 
 # Clamp a selection index into [0, count-1]; 0 when the list is empty.
@@ -182,15 +207,16 @@ fm_dock_render_list() {  # <status_json> <sel> <width> <rows> <color> <stamp> <r
       + (if ($items | length) == 0 then [ {t: ("  " + esc("2") + $empty + reset), s:false} ]
          else [ $items | to_entries[] | {t: rowline(.value; $off + .key), s: (($off + .key) == $sel)} ] end)
       + [ {t:"", s:false} ];
-    def donerow($r):
-      "  " + paint("1"; ($r.id // "-")) + "  "
+    def donerow($r; $g):
+      (if $g == $sel then paint("1;36"; "›") else " " end)
+      + " " + paint("1"; ($r.id // "-")) + "  "
       + esc("2") + (($r.title // "-") + "  [" + ($r.repo // "-") + "] " + ($r.artifact // "-")) + reset;
 
     (.sections.needs_you // []) as $ny
     | (.sections.at_risk // []) as $ar
     | (.sections.running // []) as $ru
     | (.sections.recently_done // []) as $rd
-    | ($ny | length) as $n1 | ($ar | length) as $n2
+    | ($ny | length) as $n1 | ($ar | length) as $n2 | ($ru | length) as $n3
     | ([ paint("1;36"; "Fleet Dock") + "  " + esc("2") + (.fm_home // "-") + reset
          + "   " + esc("2") + $stamp + " ⟳" + $refresh + "s" + reset, "" ]) as $head
     | ([ (esc("2") + "inbox:" + reset + " "
@@ -203,7 +229,7 @@ fm_dock_render_list() {  # <status_json> <sel> <width> <rows> <color> <stamp> <r
        + secbody($ru; ($n1 + $n2); "RUNNING"; "36"; "No tasks in flight.")
        + [ {t: (paint("32;1"; "RECENTLY DONE") + paint("2"; "  (\($rd | length))")), s:false} ]
        + (if ($rd | length) == 0 then [ {t: ("  " + esc("2") + "No recently completed work." + reset), s:false} ]
-          else [ $rd[] | {t: donerow(.), s:false} ] end)) as $body
+          else [ $rd | to_entries[] | {t: donerow(.value; ($n1 + $n2 + $n3) + .key), s: (($n1 + $n2 + $n3 + .key) == $sel)} ] end)) as $body
     # Scroll the body to a window that fits between the header and footer and
     # always contains the selected row.
     | ([$rows - ($head | length) - ($foot | length), 1] | max) as $avail
