@@ -215,11 +215,15 @@ test_reconcile_over_stale_status_log() {
       and ((.sections.running[] | select(.id == "resumed-task") | .phase) == "working")
   ' >/dev/null || fail "reconcile must follow current state, not the stale log verb: $out"
 
-  # Determinism: same inputs twice, identical output.
-  local a b
+  # Determinism: identical inputs must reduce identically. Loop so a volatile
+  # field (e.g. a snapshot wall-clock timestamp straddling a second boundary) is
+  # caught reliably, not only when two back-to-back runs happen to differ.
+  local a b k
   a=$(run_json "$home" "$fakebin")
-  b=$(run_json "$home" "$fakebin")
-  [ "$a" = "$b" ] || fail "reduction must be deterministic for identical inputs"
+  for k in $(seq 1 15); do
+    b=$(run_json "$home" "$fakebin")
+    [ "$a" = "$b" ] || fail "reduction must be deterministic for identical inputs (iter $k)"
+  done
   pass "reconciles over a stale status-log line and is deterministic"
 }
 

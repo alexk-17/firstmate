@@ -259,7 +259,10 @@ printf '%s' "$SNAPSHOT" | jq -r \
           reply_syntax: reply_syntax($t; $phase; $owner),
           pr_url: $t.pr.url,
           freshness: {epoch: fresh_epoch($t.id), age: age_text($t.id)},
-          current_state: $t.current_state
+          # Strip the volatile wall-clock observed_at from the snapshot: this is a
+          # pure reduction of fleet state, so identical inputs must reduce
+          # identically regardless of the second the snapshot was taken (freshness carries age).
+          current_state: ($t.current_state | del(.observed_at))
         };
 
     def done_records:
