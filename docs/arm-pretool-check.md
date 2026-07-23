@@ -4,6 +4,7 @@ This document is the authoritative human-readable contract for the watcher arm P
 `bin/fm-arm-command-policy.mjs` is the single semantic owner.
 `bin/fm-arm-pretool-check.sh` is only the stable harness transport and output renderer.
 The tracked harness adapters forward command text without classifying it.
+`bin/fm-arm-command-policy.mjs` is also the sole owner of firstmate's shell classification: it exports the tokenizer and command-position analysis, which the sibling cd-guard seatbelt (`bin/fm-cd-pretool-check.sh`, `docs/cd-guard.md`) reuses instead of duplicating shell lexing.
 
 ## Purpose and boundary
 
@@ -13,6 +14,17 @@ The seatbelt rejects those command shapes before execution.
 
 This policy is not a post-arm liveness guarantee.
 `bin/fm-guard.sh`, `bin/fm-turnend-guard.sh`, the watcher lock, and the watcher beacon still prove whether supervision is healthy after an allowed call.
+
+## Claude continuity gate
+
+Claude also registers `bin/fm-continuity-pretool-check.sh` for Bash PreToolUse events.
+This is a separate, tightly bounded recovery gate rather than another watcher-shape policy.
+It runs only in a primary home, and it denies only an executed `bin/fm-*.sh` command other than `bin/fm-wake-drain.sh`, `bin/fm-watch-arm.sh`, or the ordinary literal `bin/fm-teardown.sh` when task metadata is in flight and no identity-matched live watcher holds that home's lock.
+Ordinary shell commands, fleet-script names used as data, all commands in an idle fleet, child worktrees, wake drain, watcher arm, and ordinary literal teardown remain allowed.
+The denial gives Claude reason-specific recovery guidance — drain, re-arm via a tracked Claude background task, and use fail-closed `bin/fm-teardown.sh` for completed tasks — per the contract in [`watcher-continuity.md`](watcher-continuity.md).
+`bin/fm-continuity-command-policy.mjs` reuses this document's shell lexer and command-position analysis but owns the recovery-versus-other-fleet classification.
+Malformed transport or opaque dynamic syntax fails open so this narrow gate cannot become a blanket Bash block.
+The existing `bin/fm-turnend-guard.sh` Stop integration is unchanged and remains the final backstop.
 
 The classifier never executes, sources, evaluates, or expands any part of the submitted command.
 It tokenizes the bytes and classifies lexical execution positions only.
@@ -238,5 +250,5 @@ bash -n bin/fm-arm-pretool-check.sh
 shellcheck bin/fm-arm-pretool-check.sh tests/fm-arm-pretool-check.test.sh
 node --check bin/fm-arm-command-policy.mjs
 tests/fm-arm-pretool-check.test.sh
-for test_script in tests/*.test.sh; do bash "$test_script"; done
+bin/fm-test-run.sh --all
 ```

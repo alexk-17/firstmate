@@ -36,6 +36,12 @@ FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
 # absorbs them only with positive provably-working evidence, while the daemon uses
 # its away-mode classification. FM_CAPTAIN_RE overrides the whole set when a home
 # needs a custom verb vocabulary; absent, this default applies.
+#
+# Free-text tokens (PR ready, checks green, ready in branch, merged) exist only for
+# legacy lines that lack a standard terminal verb. status_is_captain_relevant is
+# verb-aware: a nonterminal working: or paused: line never becomes captain-relevant
+# merely because its prose contains one of those tokens (for example
+# "working: rebased onto merged #76").
 FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'
 
 # The deliberate-external-wait verb. A crew (or firstmate steering it) appends
@@ -51,13 +57,21 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 # drift between the two consumers. FM_CLASSIFY_PAUSED_VERB overrides it.
 FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 
-# Bounded re-surface cadence for a declared pause. Far longer than the wedge
-# threshold (FM_STALE_ESCALATE_SECS, default 240s) so a deliberate wait is not
-# nagged like a wedge, yet finite so a forgotten pause cannot rot invisibly - it
-# re-surfaces once for a recheck every window. One hour by default; both consumers
-# read FM_PAUSE_RESURFACE_SECS with this default so the cadence has one owner.
+# Bounded re-surface cadence for a declared pause or a dead-agent captain hold.
+# Far longer than the wedge threshold (FM_STALE_ESCALATE_SECS, default 240s), it
+# avoids nagging a deliberate wait while ensuring a forgotten hold cannot rot
+# invisibly - it re-surfaces once for a recheck every window. One hour by default;
+# both consumers read FM_PAUSE_RESURFACE_SECS with this default so the cadence has
+# one owner.
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
+
+# The resolution verb and durable-backlog-transfer verb that CLOSE a keyed
+# status decision opened by needs-decision or blocked. See status_open_decisions
+# below for the status-fold contract. The transfer verb is written only after
+# fm-decision-hold.sh has verified the corresponding captain-held backlog item.
+FM_CLASSIFY_RESOLVE_VERB_DEFAULT='resolved'
+FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT='captain-held'
 
 # Return the last non-blank line of a status file (empty if missing/blank).
 last_status_line() {
@@ -66,11 +80,39 @@ last_status_line() {
   grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -1
 }
 
+# 0 if the given (last) status line's leading verb is a real terminal captain verb
+# (done, needs-decision, blocked, failed). Free-text tokens alone never count here;
+# callers that need legacy free-text matching use status_is_captain_relevant.
+status_is_terminal_verb() {
+  local line=$1 verb
+  [ -n "$line" ] || return 1
+  verb=$(status_line_verb "$line")
+  case "$verb" in
+    done|needs-decision|blocked|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # 0 if the given (last) status line matches a captain-relevant verb.
+# Verb-aware by default: terminal verbs always match; nonterminal progress verbs
+# (working, resolved, captain-held) and paused never match from free-text prose;
+# only lines without those leading verbs may still match free-text tokens for
+# legacy bare lines such as "merged" or "PR ready".
 status_is_captain_relevant() {
-  local line=$1
+  local line=$1 verb
   [ -n "$line" ] || return 1
   status_is_paused "$line" && return 1
+  verb=$(status_line_verb "$line")
+  case "$verb" in
+    working|resolved|captain-held|"${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}")
+      return 1
+      ;;
+  esac
+  if [ -z "${FM_CAPTAIN_RE+x}" ]; then
+    case "$verb" in
+      done|needs-decision|blocked|failed) return 0 ;;
+    esac
+  fi
   printf '%s' "$line" | grep -qiE "${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}"
 }
 
@@ -81,10 +123,159 @@ status_is_captain_relevant() {
 status_is_paused() {  # <status-line>
   local line=$1 verb
   [ -n "$line" ] || return 1
-  verb=${line%%:*}
-  verb=${verb#"${verb%%[![:space:]]*}"}
-  verb=${verb%"${verb##*[![:space:]]}"}
+  verb=$(status_line_verb "$line")
   [ "$verb" = "${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}" ]
+}
+
+# 0 if a status line declares either an external-wait pause or a verified
+# captain-held transfer.
+# Both declarations can intentionally leave an exited crew's endpoint idle, so
+# the watcher applies its bounded pause cadence when agent death confirms that
+# no live decision gate is being silenced.
+status_is_paused_or_captain_held() {  # <status-line>
+  local line=$1 verb
+  status_is_paused "$line" && return 0
+  [ -n "$line" ] || return 1
+  verb=$(status_line_verb "$line")
+  [ "$verb" = "${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}" ]
+}
+
+# --- durable keyed decisions ------------------------------------------------
+#
+# The status stream is an append-only EVENT log. Reading it last-event-wins
+# (last_status_line above) cannot represent "an earlier decision is still open
+# after a later, unrelated event": a subsequent done/paused/working line silently
+# masks a still-open needs-decision. status_open_decisions is the ONE authoritative
+# statement of the status-fold contract that fixes this - a needs-decision/blocked
+# line OPENS a keyed decision, and only an explicit resolution or a verified
+# captain-held backlog transfer referencing that key CLOSES it; a later unrelated
+# terminal line never clears an open captain decision.
+#
+# Decision key grammar (backward-compatible with the existing "<verb>: <note>"
+# format): an OPTIONAL "[key=<slug>]" token sits between the verb and the colon,
+#   needs-decision [key=api-shape]: <summary>
+#   resolved       [key=api-shape]: <how it was decided>
+# A line with no token uses the key "default", preserving the historical
+# one-open-decision-per-task behavior (a bare "resolved:" closes "default").
+# The three parsers are pure reads of a single line; the verb parser strips any
+# key token before the colon so the leading word is recovered cleanly.
+status_line_verb() {  # <status-line> -> leading verb word
+  local v=${1%%:*}
+  v=${v%%\[key=*}
+  v=${v#"${v%%[![:space:]]*}"}
+  v=${v%"${v##*[![:space:]]}"}
+  printf '%s' "$v"
+}
+status_line_note() {  # <status-line> -> text after the first colon, trimmed
+  case "$1" in
+    *:*) local n=${1#*:}; printf '%s' "${n#"${n%%[![:space:]]*}"}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+_fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
+  local prefix=${1%%:*} k
+  case "$prefix" in
+    *\[key=*\]*)
+      k=${prefix#*\[key=}
+      k=${k%%\]*}
+      case "$k" in
+        ''|*[!A-Za-z0-9._-]*) return 1 ;;
+        *) printf '%s' "$k" ;;
+      esac
+      ;;
+    *) printf 'default' ;;
+  esac
+}
+# Drop the record for <key> from a newline-terminated "<key>\t<verb>\t<note>" set.
+# Portable (no associative arrays) so the fold runs on bash 3.2 as well as 4+.
+_fm_decision_drop() {  # <open-set> <key>
+  local set=$1 key=$2 line out=''
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      "$key"$'\t'*) : ;;
+      *) out="${out}${line}"$'\n' ;;
+    esac
+  done <<EOF
+$set
+EOF
+  printf '%s' "$out"
+}
+# Fold the WHOLE status stream into the set of decisions still open. Prints one
+# TAB-separated "<key>\t<verb>\t<summary>" line per still-open decision, in
+# most-recently-opened-last order; prints nothing when none are open. Pure read of
+# the file, no globals beyond the optional FM_CLASSIFY_RESOLVE_VERB override. This
+# is the durable open-set the fleet snapshot and any point-in-time consumer must use
+# instead of trusting the last status line.
+status_open_decisions() {  # <status-file>
+  local f=$1 line verb key note resolve held open='' stripped
+  [ -f "$f" ] || return 0
+  resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
+  held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
+  while IFS= read -r line || [ -n "$line" ]; do
+    stripped=${line//[[:space:]]/}
+    [ -n "$stripped" ] || continue
+    verb=$(status_line_verb "$line")
+    key=$(_fm_decision_key "$line") || continue
+    case "$verb" in
+      needs-decision|blocked)
+        note=$(status_line_note "$line")
+        open=$(_fm_decision_drop "$open" "$key")
+        [ -n "$open" ] && open="${open}"$'\n'
+        open="${open}${key}"$'\t'"${verb}"$'\t'"${note}"$'\n'
+        ;;
+      "$resolve"|"$held")
+        open=$(_fm_decision_drop "$open" "$key")
+        [ -n "$open" ] && open="${open}"$'\n'
+        ;;
+    esac
+  done < "$f"
+  printf '%s' "$open"
+}
+
+# Fold material routed-work phases in the same keyed event stream.
+# A working or declared-pause event opens or replaces one phase for its key.
+# A later done, failed, needs-decision, blocked, or resolved event carrying that
+# key closes the phase, because it has moved to a terminal or separately tracked
+# state.
+# A bare legacy event uses the default key, preserving one-phase behavior.
+# This fold is evidence about whether a parent event was explicitly superseded.
+# It is never authoritative current crew state, and consumers must not let an open
+# phase outrank a structured home snapshot or fm-crew-state result.
+_fm_status_open_activities_stream() {
+  local line verb key note resolve held open='' stripped pause
+  resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
+  held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
+  pause=${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}
+  while IFS= read -r line || [ -n "$line" ]; do
+    stripped=${line//[[:space:]]/}
+    [ -n "$stripped" ] || continue
+    verb=$(status_line_verb "$line")
+    key=$(_fm_decision_key "$line") || continue
+    case "$verb" in
+      working|"$pause")
+        note=$(status_line_note "$line")
+        open=$(_fm_decision_drop "$open" "$key")
+        [ -n "$open" ] && open="${open}"$'\n'
+        open="${open}${key}"$'\t'"${verb}"$'\t'"${note}"$'\n'
+        ;;
+      done|failed|needs-decision|blocked|"$resolve"|"$held")
+        open=$(_fm_decision_drop "$open" "$key")
+        [ -n "$open" ] && open="${open}"$'\n'
+        ;;
+    esac
+  done
+  printf '%s' "$open"
+}
+
+status_open_activities() {  # <status-file-or-dash>
+  local f=$1
+  if [ "$f" = - ]; then
+    _fm_status_open_activities_stream
+    return 0
+  fi
+  [ -f "$f" ] || return 0
+  _fm_status_open_activities_stream < "$f"
 }
 
 # task id from a recorded window target, falling back to the tmux-shaped

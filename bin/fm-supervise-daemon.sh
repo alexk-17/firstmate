@@ -20,13 +20,16 @@
 # state/.subsuper-escalations and are flushed on the next "while you were out"
 # catch-up or when afk is re-entered.
 #
-# IN-BAND SENTINEL MARKER. Every daemon injection is prefixed with
-# FM_INJECT_MARK (ASCII unit separator, 0x1f) — a byte a human would never type
-# at the start of a message. Firstmate's contract: a message that starts with
-# the marker is an internal escalation (stay afk); a message without it means
-# the captain is back (exit afk, flush catch-up, resume per-wake responsiveness).
-# The marker and the busy-guard solve the same problem — the daemon and the
-# human share one input channel — so they live together under /afk.
+# IN-BAND OPERATIONAL INPUT. bin/fm-operational-input.sh constructs every
+# current daemon injection as the typed away-supervisor kind after the stable
+# FM_OPERATIONAL_PREFIX. A human cannot type its leading U+2063 from a normal
+# keyboard at the start of a message, and Herdr transports it as text.
+# Firstmate's contract: a message that starts with the current prefix, or a
+# legacy bare-marker daemon escalation, is internal (stay afk); an unmarked
+# message means the captain is back (exit afk, flush catch-up, resume per-wake
+# responsiveness). The prefix and busy-guard solve the same problem - the
+# daemon and the human share one input channel - so they live together under
+# /afk.
 #
 # Reliability model (see the /afk skill):
 #   - Nothing is lost in away mode: while state/.afk exists, the watcher reverts
@@ -153,6 +156,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-backend.sh
 . "$FM_DAEMON_DIR/fm-backend.sh"
 
+# Canonical construction and parsing for every Firstmate operational input.
+# shellcheck source=bin/fm-operational-input.sh
+. "$FM_DAEMON_DIR/fm-operational-input.sh"
+
 # Shared wake classifier (last_status_line, status_is_captain_relevant,
 # window_to_task, scan_captain_relevant_statuses). The SAME library backs the
 # always-on watcher's triage, so the captain-relevant verb set and the
@@ -160,13 +167,14 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$FM_DAEMON_DIR/fm-classify-lib.sh"
 
+# Supervisor-pane discovery (FM_SUPERVISOR_TARGET_DEFAULT,
+# FM_SUPERVISOR_BACKEND_DEFAULT, discover_supervisor_target,
+# discover_supervisor_backend). Shared with the script-owned away launcher
+# (bin/fm-afk-launch.sh) so the captain-pane resolution has exactly one owner.
+# shellcheck source=bin/fm-supervisor-target-lib.sh
+. "$FM_DAEMON_DIR/fm-supervisor-target-lib.sh"
+
 # --- tunables ---------------------------------------------------------------
-FM_SUPERVISOR_TARGET_DEFAULT="firstmate:0"
-# Fallback BACKEND paired with the fallback target above: "firstmate:0" is a
-# tmux session:window name, so the bare fallback (nothing configured, nothing
-# detected) assumes tmux - matching this daemon's pre-herdr-support behavior
-# byte-for-byte when run outside both tmux and herdr.
-FM_SUPERVISOR_BACKEND_DEFAULT="tmux"
 # Supervisor backends this daemon knows how to inject into today. zellij, orca,
 # and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
 # daemon has no verified composer/busy primitives wired up for them yet - see
@@ -203,14 +211,10 @@ CRASH_NORMAL_SLEEP_DEFAULT=5
 LOG_MAX_BYTES_DEFAULT=1048576
 LOG_KEEP_LINES_DEFAULT=2000
 
-# --- presence-gating + sentinel marker --------------------------------------
-# The in-band sentinel: ASCII unit separator (0x1f). Invisible and untypable on
-# a normal keyboard, so no real user message starts with it. Every daemon
-# injection is prefixed with this byte; firstmate treats a leading marker as an
-# internal escalation (stay afk) and its absence as "captain is back" (exit afk).
-# Portable across harnesses: it travels with the message text, independent of
-# any harness-level typed-vs-injected distinction.
-FM_INJECT_MARK=$'\x1f'
+# --- presence-gating --------------------------------------------------------
+# bin/fm-operational-input.sh owns the U+2063 FIRSTMATE_OP bytes and typed
+# away-supervisor construction. The away-exit predicate intentionally retains
+# its landed leading-U+2063 compatibility behavior.
 AFK_FLAG_NAME=".afk"
 
 # Resolve the effective state dir. FM_STATE_OVERRIDE wins (testing); otherwise
@@ -284,13 +288,20 @@ message_is_injection() {  # <message-text>
   return 1
 }
 
-# strip_injection_marker: remove the leading sentinel marker (if present) so the
-# digest text is clean for classification/relay. The afk-exit contract keys off
-# the marker's PRESENCE; once detected, the marker byte should not appear in the
-# distilled content firstmate relays to the captain or feeds back to classifiers.
+# strip_injection_marker: remove a current typed away envelope, the landed
+# untyped FIRSTMATE_OP prefix, or the legacy bare sentinel. Current grammar is
+# delegated to its owner rather than reimplemented here.
 strip_injection_marker() {  # <message-text>
-  local msg=$1
-  printf '%s' "${msg#"$FM_INJECT_MARK"}"
+  local msg=$1 body
+  if fm_operational_input_body "$msg" body; then
+    printf '%s' "$body"
+    return
+  fi
+  case "$msg" in
+    "$FM_OPERATIONAL_PREFIX"*) msg=${msg#"$FM_OPERATIONAL_PREFIX"} ;;
+    "$FM_INJECT_MARK"*) msg=${msg#"$FM_INJECT_MARK"} ;;
+  esac
+  printf '%s' "$msg"
 }
 
 # Collapse all newlines to a literal " - " separator so the injected digest is
@@ -302,65 +313,10 @@ _collapse_newlines() {  # <text>
   printf '%s' "$s"
 }
 
-# Auto-discover the supervisor pane at startup. Priority:
-#   1. FM_SUPERVISOR_TARGET env (explicit override) — caller passes it in;
-#      may be a tmux target or a herdr "<session>:<pane-id>" target (paired
-#      with discover_supervisor_backend, below, to know which).
-#   2. $TMUX_PANE — tmux sets this in every pane's environment; inherited by
-#      the daemon when the /afk skill launches it from firstmate's own pane.
-#   3. $HERDR_ENV=1 + $HERDR_PANE_ID — herdr injects both into every process
-#      it manages a pane for (docs/herdr-backend.md); the daemon composes the
-#      "<session>:<pane-id>" target string the herdr adapter expects from
-#      $HERDR_SESSION (defaulting to "default", mirroring
-#      bin/backends/herdr.sh's fm_backend_herdr_session) and $HERDR_PANE_ID.
-#      Checked after $TMUX_PANE so a tmux pane nested inside herdr still
-#      resolves to tmux, matching fm_backend_detect's innermost-first rule.
-#   4. firstmate:0 — legacy tmux fallback (may not resolve if the session is
-#      named differently). The caller logs a warning in that case.
-# Returns the resolved target on stdout; returns 1 if only the fallback is left
-# AND the fallback does not resolve to a live pane.
-discover_supervisor_target() {
-  if [ -n "${FM_SUPERVISOR_TARGET:-}" ]; then
-    printf '%s' "$FM_SUPERVISOR_TARGET"
-    return 0
-  fi
-  if [ -n "${TMUX_PANE:-}" ]; then
-    printf '%s' "$TMUX_PANE"
-    return 0
-  fi
-  if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-    printf '%s:%s' "${HERDR_SESSION:-default}" "$HERDR_PANE_ID"
-    return 0
-  fi
-  printf '%s' "$FM_SUPERVISOR_TARGET_DEFAULT"
-  return 1
-}
-
-# Auto-discover the supervisor's BACKEND at startup - independent of the
-# target string above, so an explicit FM_SUPERVISOR_TARGET override still
-# needs to know which primitives (tmux vs herdr) to dispatch through. Priority
-# mirrors discover_supervisor_target and bin/fm-backend.sh's fm_backend_detect:
-#   1. FM_SUPERVISOR_BACKEND env (explicit override).
-#   2. $TMUX_PANE set — tmux.
-#   3. $HERDR_ENV=1 (with $HERDR_PANE_ID present) — herdr.
-#   4. FM_SUPERVISOR_BACKEND_DEFAULT (tmux) — matches the target fallback above.
-# Returns the resolved backend on stdout; returns 1 if only the fallback is left.
-discover_supervisor_backend() {
-  if [ -n "${FM_SUPERVISOR_BACKEND:-}" ]; then
-    printf '%s' "$FM_SUPERVISOR_BACKEND"
-    return 0
-  fi
-  if [ -n "${TMUX_PANE:-}" ]; then
-    printf 'tmux'
-    return 0
-  fi
-  if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-    printf 'herdr'
-    return 0
-  fi
-  printf '%s' "$FM_SUPERVISOR_BACKEND_DEFAULT"
-  return 1
-}
+# discover_supervisor_target / discover_supervisor_backend are owned by
+# bin/fm-supervisor-target-lib.sh (sourced above). fm_super_main below calls
+# them exactly as before; the away launcher reuses the identical resolution to
+# pass the captain pane in as FM_SUPERVISOR_TARGET.
 
 # --- classification helpers (PURE: no side effects, testable) ---------------
 # last_status_line, status_is_captain_relevant, window_to_task, and
@@ -420,6 +376,19 @@ classify_stale() {  # <window> <state>
     return
   fi
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
+    # Independent of free-text captain-relevant matching: a nonterminal progress
+    # verb (working:) must never take the terminal stale path. Seen-status dedupe
+    # must not permanently suppress or clear possible-wedge aging merely because
+    # prose once looked captain-relevant. Real terminal verbs and legacy free-text
+    # captain lines without those verbs keep the terminal escalate/dedupe path.
+    if ! status_is_terminal_verb "$last"; then
+      case "$(status_line_verb "$last")" in
+        working|resolved|captain-held)
+          printf 'self|transient stale (%s): %s' "$win" "$last"
+          return
+          ;;
+      esac
+    fi
     # Dedupe against the signal path: if this status was already escalated
     # (seen marker matches), self-handle to avoid a duplicate in the digest.
     seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
@@ -1131,7 +1100,7 @@ window_for_task() {  # <task-key> [state]
 #     line, or a previous injection's unsent text), defer entirely - injecting
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
-  local msg=$1 state target backend retries sleep_s verdict composer
+  local msg=$1 state target backend retries sleep_s verdict composer encoded
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
@@ -1139,10 +1108,11 @@ inject_msg() {  # <message> [state]
   afk_active "$state" || { log "inject deferred: afk inactive"; return 1; }
   # (2) Single-line digest: collapse any embedded newlines so submission via
   # send-keys + Enter is unambiguous regardless of how the TUI composer treats
-  # them. Then prepend the sentinel marker - firstmate's afk-exit contract
-  # keys off its presence at the start of the message.
+  # them. Then use the canonical typed envelope so downstream consumers retain
+  # the exact away-supervisor kind without interpreting this payload's prose.
   msg=$(_collapse_newlines "$msg")
-  msg="${FM_INJECT_MARK}${msg}"
+  fm_operational_input_encode away-supervisor "$msg" encoded || return 1
+  msg=$encoded
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   # BACKEND-AWARE (previously a raw `tmux display-message` pane-exists probe):
   # dispatches through bin/fm-backend.sh so a herdr supervisor pane is checked
@@ -1267,7 +1237,21 @@ handle_wake() {  # <reason> <state>
       if [ "$kind" = "stale" ]; then
         task=$(window_to_task "$arg" "$state")
         last=$(last_status_line "$state/$task.status")
+        # Clear wedge aging only for terminal (or legacy free-text) captain lines.
+        # Nonterminal progress verbs keep possible-wedge markers even if free text
+        # once looked captain-relevant or was written into a seen marker.
+        _clear_wedge=0
         if [ -n "$last" ] && status_is_captain_relevant "$last"; then
+          if status_is_terminal_verb "$last"; then
+            _clear_wedge=1
+          else
+            case "$(status_line_verb "$last")" in
+              working|resolved|captain-held) _clear_wedge=0 ;;
+              *) _clear_wedge=1 ;;
+            esac
+          fi
+        fi
+        if [ "$_clear_wedge" = 1 ]; then
           stale_marker_remove "$arg" "$state"
         else
           pause_marker_remove "$arg" "$state"

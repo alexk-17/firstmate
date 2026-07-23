@@ -15,12 +15,17 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-brief)
+BRIEF_HOME="$TMP_ROOT/home"
+mkdir -p "$BRIEF_HOME/data"
 
 # The script itself must always parse. This is the direct regression test for
 # issue #166: a stray apostrophe in any of the three DOD heredoc bodies
 # (no-mistakes/direct-PR/local-only) breaks `bash -n` on the whole file.
 test_script_parses() {
-  bash -n "$ROOT/bin/fm-brief.sh" 2>&1 || fail "bin/fm-brief.sh fails bash -n (heredoc/quote regression)"
+  local out rc
+  out=$(bash -n "$ROOT/bin/fm-brief.sh" 2>&1); rc=$?
+  expect_code 0 "$rc" "bash -n bin/fm-brief.sh must parse cleanly (got: $out)"
+  [ -z "$out" ] || fail "bash -n bin/fm-brief.sh emitted unexpected output: $out"
   pass "fm-brief.sh: bash -n succeeds"
 }
 
@@ -61,9 +66,34 @@ test_ship_modes_generate_clean_briefs() {
     assert_present "$brief" "$id: brief was not scaffolded"
     assert_grep "# Definition of done" "$brief" "$id: brief missing Definition of done section"
     assert_grep "{TASK}" "$brief" "$id: brief missing the {TASK} placeholder"
+    assert_grep "mid-task \`working:\` line (including setup complete) is nonterminal" "$brief" \
+      "$id: brief missing nonterminal working:/setup-complete gate protection"
     assert_no_grep "EOF" "$brief" "$id: brief leaked a heredoc EOF marker (unterminated heredoc)"
   done
   pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
+}
+
+test_faster_paths_use_configured_authority_without_stacked_review() {
+  local home id brief
+  home="$TMP_ROOT/configured-authority-home"
+  write_registry "$home"
+  id="brief-direct-authority-a4"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" direct-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "The configured merge authority decides whether to merge the PR; firstmate relays the outcome." "$brief" \
+    "direct-PR brief lost configured merge authority"
+  assert_no_grep "The captain reviews and merges the PR" "$brief" \
+    "direct-PR brief hard-coded captain-only authority"
+  id="brief-local-authority-a4"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" local-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "The configured merge authority approves the ready branch, then firstmate merges it into local \`main\` through the guarded fast-forward path." "$brief" \
+    "local-only brief lost configured merge authority and guarded landing"
+  assert_no_grep "The captain approves the ready branch" "$brief" \
+    "local-only brief hard-coded captain-only authority"
+  assert_no_grep "Firstmate then reviews your branch diff" "$brief" \
+    "local-only brief retained a personal review stacked on the selected delivery path"
+  pass "fm-brief.sh: faster paths use configured authority without stacked review"
 }
 
 # Pin the specific line the bug lived on: the no-mistakes DOD's no-mistakes
@@ -78,6 +108,12 @@ test_no_mistakes_dod_wording() {
   assert_present "$brief" "brief was not scaffolded"
   assert_grep "no-mistakes itself provides for the mechanics" "$brief" \
     "no-mistakes DOD lost its guidance-reference sentence"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '`no-mistakes axi run --help`' "$brief" \
+    "no-mistakes DOD must render literal backticks around the help command"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '`help`' "$brief" \
+    "no-mistakes DOD must render literal backticks around help"
   assert_no_grep "no-mistakes' own guidance" "$brief" \
     "no-mistakes DOD regressed to the apostrophe form that breaks bash -n"
   pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
@@ -188,6 +224,12 @@ test_secondmate_no_projects_charter() {
     "project-less charter operating model lost the pooled-worktree note"
   assert_no_grep "The projects above are local clones" "$brief" \
     "project-less charter kept the with-projects operating-model line"
+  assert_grep 'working [key=<work-slug>]' "$brief" \
+    "secondmate charter did not key material routed-work phases"
+  assert_grep 'resolved [key=<work-slug>]' "$brief" \
+    "secondmate charter did not close a quietly ended routed-work phase"
+  assert_grep 'use the same key on its later' "$brief" \
+    "secondmate charter did not supersede working phases with later states"
   if grep -nE '^-[[:space:]]*$' "$brief" >/dev/null; then
     fail "project-less charter left a stray empty project bullet"
   fi
@@ -206,6 +248,47 @@ test_secondmate_no_projects_charter() {
   expect_code 1 "$status" "--no-projects on a ship brief must fail"
 
   pass "fm-brief.sh: --no-projects scaffolds a project-less charter and guards misuse"
+}
+
+test_secondmate_marked_request_reporting_contract() {
+  local home brief
+  home="$TMP_ROOT/marked-request-reporting-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=paused \
+    FM_SECONDMATE_CHARTER='Handle routed domain work.' \
+    "$ROOT/bin/fm-brief.sh" marked-request-reporting --secondmate --no-projects >/dev/null 2>&1
+  brief="$home/data/marked-request-reporting/brief.md"
+
+  assert_grep 'A marked request requires one correlated answer after the work' "$brief" \
+    "secondmate charter did not require the correlated answer after the work"
+  assert_grep 'does not require a separate receipt or start acknowledgement' "$brief" \
+    "secondmate charter did not reject a separate receipt/start acknowledgement"
+  assert_grep "Never append \`working:\` merely to acknowledge receipt or announce that a marked request has started." "$brief" \
+    "secondmate charter did not forbid a generic working acknowledgement"
+  assert_no_grep "Give every routed-work phase a stable key: open it with \`working" "$brief" \
+    "secondmate charter retained the unconditional working opener"
+  assert_grep 'When a routed-work phase has a supervisor-actionable material change worth reporting under the rule above' "$brief" \
+    "secondmate charter did not limit keyed phases to reportable material changes"
+  assert_grep "If its first reportable event is \`working [key=<work-slug>]: {material phase}\`" "$brief" \
+    "secondmate charter lost keyed working syntax for a reportable material phase"
+  assert_grep "use the same key on its later \`paused\`, \`done\`, \`failed\`, \`needs-decision\`, or \`blocked\` event" "$brief" \
+    "secondmate charter lost same-key closure for a reportable material phase"
+  assert_grep 'resolved [key=<work-slug>]' "$brief" \
+    "secondmate charter lost resolved closure for a keyed material phase"
+
+  assert_grep 'include that exact token in your parent status reply' "$brief" \
+    "secondmate charter lost correlated parent results"
+  assert_grep 'For a terse result, a status line is the whole answer.' "$brief" \
+    "secondmate charter lost terse result reporting"
+  assert_grep 'append a status line that points to that doc' "$brief" \
+    "secondmate charter lost detailed document pointers"
+  assert_grep 'Report only true captain-relevant outcomes or a declared external wait' "$brief" \
+    "secondmate charter lost declared external waits"
+  assert_grep 'a captain decision, a real blocker, a failure, or work ready for review' "$brief" \
+    "secondmate charter lost decisions, blockers, failures, or ready outcomes"
+  assert_grep 'States: working, needs-decision, blocked, paused, done, failed.' "$brief" \
+    "secondmate charter changed the preserved status vocabulary"
+  pass "fm-brief.sh: marked requests avoid generic acknowledgements and preserve material reporting"
 }
 
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates() {
@@ -254,13 +337,55 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
     assert_no_grep '`paused: {why}`' "$brief" \
       "$kind brief still instructs the default paused status"
+    assert_grep 'or a blocker clears' "$brief" \
+      "$kind brief did not require durable resolution when a blocker clears"
   done
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
+}
+
+test_scout_and_secondmate_load_decision_hold_policy() {
+  local home scout charter
+  home="$TMP_ROOT/decision-policy-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-brief.sh" sample-investigation sample --scout >/dev/null 2>&1
+  scout="$home/data/sample-investigation/brief.md"
+  assert_grep "$ROOT/.agents/skills/decision-hold-lifecycle/SKILL.md" "$scout" \
+    "scout brief did not load the unresolved-decision policy before done"
+  assert_grep "pass its shared completion gate for the report and any visual review" "$scout" \
+    "scout brief did not cross-reference visual-review completion"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_SECONDMATE_CHARTER='sample reviews' \
+    "$ROOT/bin/fm-brief.sh" sample-mate --secondmate --no-projects >/dev/null 2>&1
+  charter="$home/data/sample-mate/brief.md"
+  assert_grep "load \`decision-hold-lifecycle\`" "$charter" \
+    "secondmate charter did not load the shared decision policy for detailed investigations"
+  pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
+}
+
+# Scout and secondmate paths still scaffold well-formed briefs.
+test_scout_and_secondmate_scaffold() {
+  local brief
+  FM_HOME="$BRIEF_HOME" "$ROOT/bin/fm-brief.sh" brief-scout-q6 alpha --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+  brief="$BRIEF_HOME/data/brief-scout-q6/brief.md"
+  assert_present "$brief" "scout brief was not scaffolded"
+  assert_grep "SCOUT task" "$brief" "scout brief must declare itself a scout task"
+  assert_grep "report.md" "$brief" "scout brief must point at the report deliverable"
+
+  FM_SECONDMATE_CHARTER='Supervise the alpha domain.' \
+    FM_HOME="$BRIEF_HOME" "$ROOT/bin/fm-brief.sh" brief-sm-q6 --secondmate alpha >/dev/null 2>&1 \
+    || fail "fm-brief.sh secondmate scaffold exited non-zero"
+  brief="$BRIEF_HOME/data/brief-sm-q6/brief.md"
+  assert_present "$brief" "secondmate charter was not scaffolded"
+  assert_grep "persistent second mate" "$brief" \
+    "secondmate charter must declare its role"
+  pass "fm-brief: scout and secondmate code paths still scaffold well-formed briefs"
 }
 
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
+test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
@@ -268,4 +393,7 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
+test_secondmate_marked_request_reporting_contract
 test_pause_verb_override_renders_all_brief_scaffolds
+test_scout_and_secondmate_load_decision_hold_policy
+test_scout_and_secondmate_scaffold

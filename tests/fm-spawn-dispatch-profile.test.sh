@@ -105,7 +105,7 @@ assert_meta_profile() {
   assert_grep "effort=$effort" "$meta" "meta missing effort=$effort"
 }
 
-test_no_profile_keeps_claude_launch_unchanged() {
+test_no_profile_keeps_claude_profile_defaults() {
   local rec id out status expected launch
   id=profile-off-z1
   rec=$(make_spawn_case profile-off claude "$id")
@@ -118,9 +118,9 @@ test_no_profile_keeps_claude_launch_unchanged() {
   assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
 
   launch=$(cat "$LAUNCH_LOG")
-  expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
-  [ "$launch" = "$expected" ] || fail "no-profile claude launch changed"$'\n'"expected: $expected"$'\n'"actual:   $launch"
-  pass "no --model/--effort records defaults and keeps the claude launch byte-identical"
+  expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$HOME_DIR/data/$id/brief.md')\""
+  [ "$launch" = "$expected" ] || fail "no-profile claude launch did not use the canonical launch kind"$'\n'"expected: $expected"$'\n'"actual:   $launch"
+  pass "no --model/--effort records defaults and types the claude launch instructions"
 }
 
 test_active_dispatch_profile_requires_explicit_harness_for_ship() {
@@ -285,11 +285,30 @@ test_grok_omits_invalid_max_reasoning_effort() {
   expect_code 0 "$status" "grok spawn with unsupported max reasoning effort should omit the effort flag"
   assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 max
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$(cat " \
-    "grok launch did not preserve the model flag when max effort was omitted"
+  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < " \
+    "grok launch did not preserve the model flag and typed brief when max effort was omitted"
   assert_not_contains "$launch" "--reasoning-effort" "grok launch must omit unsupported max reasoning effort"
   assert_not_contains "$launch" "--effort" "grok launch must not fall back to --effort for reasoning effort"
   pass "grok omits unsupported max reasoning effort"
+}
+
+test_grok_omits_invalid_xhigh_reasoning_effort() {
+  local rec id out status launch
+  id=profile-grok-xhigh-z6b
+  rec=$(make_spawn_case profile-grok-xhigh grok "$id")
+  read_case_record "$rec"
+
+  # grok 0.2.99 rejects xhigh (accepted set is only low|medium|high).
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model grok-4 --effort xhigh)
+  status=$?
+  expect_code 0 "$status" "grok spawn with unsupported xhigh reasoning effort should omit the effort flag"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 xhigh
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < " \
+    "grok launch did not preserve the model flag and typed brief when xhigh effort was omitted"
+  assert_not_contains "$launch" "--reasoning-effort" "grok launch must omit unsupported xhigh reasoning effort"
+  assert_not_contains "$launch" "--effort" "grok launch must not fall back to --effort for reasoning effort"
+  pass "grok omits unsupported xhigh reasoning effort"
 }
 
 test_opencode_threads_model_and_ignores_effort_axis() {
@@ -311,20 +330,57 @@ test_opencode_threads_model_and_ignores_effort_axis() {
   pass "opencode receives --model and omits the unsupported effort axis"
 }
 
-test_pi_omits_invalid_max_effort() {
+test_pi_threads_model_and_max_effort() {
   local rec id out status launch
   id=profile-pi-z8
   rec=$(make_spawn_case profile-pi pi "$id")
   read_case_record "$rec"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort max)
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --model openai-codex/gpt-5.6-sol --effort max)
   status=$?
-  expect_code 0 "$status" "pi spawn with max effort should not pass an invalid flag"
-  assert_meta_profile "$HOME_DIR/state/$id.meta" pi sonnet max
+  expect_code 0 "$status" "pi spawn with max effort should succeed"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" pi openai-codex/gpt-5.6-sol max
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "pi --model 'sonnet' -e" "pi launch did not thread model"
-  assert_not_contains "$launch" "--thinking" "pi launch must omit --thinking max because the CLI rejects it"
-  pass "pi threads model and omits unsupported max effort"
+  assert_contains "$launch" "pi --model 'openai-codex/gpt-5.6-sol' --thinking 'max' -e" \
+    "pi launch did not thread the requested model and max thinking level"
+  assert_contains "$launch" "FM_FIRSTMATE_PI_LAUNCH_BRIEF='" \
+    "pi launch did not retain its legacy positional-brief source binding for Calm"
+  pass "pi receives --model and --thinking max profile flags"
+}
+
+test_quota_selected_default_array_reaches_spawn() {
+  local rec id quota random selected diagnostic harness model effort out status launch
+  id=profile-selected-default-z17
+  rec=$(make_spawn_case profile-selected-default claude "$id")
+  read_case_record "$rec"
+  cat > "$HOME_DIR/config/crew-dispatch.json" <<'JSON'
+{"default":[{"harness":"claude","model":"claude-sonnet-5","effort":"low"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]}
+JSON
+  quota="$CASE_DIR/quota.json"
+  random="$CASE_DIR/random"
+  printf '\000\000\000\000' > "$random"
+  cat > "$quota" <<'JSON'
+{"schemaVersion":2,"providers":[{"provider":"claude","state":{"status":"fresh"},"windows":[{"id":"five_hour","kind":"session","percentRemaining":10}]},{"provider":"codex","state":{"status":"fresh"},"windows":[{"id":"five_hour","kind":"session","percentRemaining":90}]}]}
+JSON
+
+  selected=$(FM_DISPATCH_RANDOM_SOURCE="$random" "$ROOT/bin/fm-dispatch-select.sh" --quota-json "$quota" \
+    "$(jq -c .default "$HOME_DIR/config/crew-dispatch.json")" 2>"$CASE_DIR/selection.err")
+  diagnostic=$(cat "$CASE_DIR/selection.err")
+  harness=$(printf '%s\n' "$selected" | jq -r .harness)
+  model=$(printf '%s\n' "$selected" | jq -r .model)
+  effort=$(printf '%s\n' "$selected" | jq -r .effort)
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --harness "$harness" --model "$model" --effort "$effort")
+  status=$?
+
+  expect_code 0 "$status" "quota-selected default-array profile should reach spawn"
+  assert_contains "$diagnostic" "selection basis: quota-selected" "selection did not expose its quota basis"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5.5 high
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "codex --model 'gpt-5.5' -c 'model_reasoning_effort=\"high\"'" \
+    "quota-selected default profile did not reach the concrete launch"
+  pass "top-level default array resolves through quota selection into the real spawn path"
 }
 
 test_batch_forwards_shared_profile_flags() {
@@ -364,7 +420,7 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
-test_no_profile_keeps_claude_launch_unchanged
+test_no_profile_keeps_claude_profile_defaults
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
 test_active_dispatch_profile_allows_explicit_harness
@@ -375,8 +431,10 @@ test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
+test_grok_omits_invalid_xhigh_reasoning_effort
 test_opencode_threads_model_and_ignores_effort_axis
-test_pi_omits_invalid_max_effort
+test_pi_threads_model_and_max_effort
+test_quota_selected_default_array_reaches_spawn
 test_batch_forwards_shared_profile_flags
 test_active_dispatch_profile_does_not_block_secondmate_launch
 

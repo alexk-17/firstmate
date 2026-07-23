@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Atomically drain durable watcher wake records, then assert watcher liveness.
+# Atomically drain durable watcher wake records, optionally annotate validated
+# signal status keys after raw consumption commits, then assert liveness.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DRAIN_TMP=
 DRAIN_LOCK_HELD=false
+RAW_ROWS=
 
 # Turn-start fallback for the captain command inbox. The live path is the
 # watcher's inbox poll, which enqueues an `inbox` wake when armed. But when no
@@ -46,7 +48,7 @@ release_queue_lock() {
 # every wake-handling and recovery turn, so assert watcher liveness here too. A
 # lapsed supervision chain then surfaces on a plain drain-and-handle turn, not
 # only when a guarded supervision script (fm-peek/fm-send/...) happens to run.
-# Reuse fm-guard.sh's existing graced, beacon-based banner (FM_GUARD_GRACE) - do
+# Reuse fm-guard.sh's existing graced, beacon-based alarm (FM_GUARD_GRACE) - do
 # not duplicate the beacon math. Because the watcher touches its beacon every
 # poll cycle, a normal fire leaves a recent beacon well inside grace and stays
 # silent; only a genuine stale-beyond-grace lapse with work in flight warns. Call
@@ -89,9 +91,25 @@ rm -f "$DRAIN_TMP"
 mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
 : > "$FM_WAKE_QUEUE" || exit 1
 
-fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
-rm -f "$DRAIN_TMP"
+RAW_ROWS=$(fm_wake_print_deduped "$DRAIN_TMP") || exit "$?"
+case "${FM_WAKE_DRAIN_TEST_DELAY_BEFORE_COMMIT:-0}" in
+  0) ;;
+  ''|*[!0-9]*) ;;
+  *) sleep "$FM_WAKE_DRAIN_TEST_DELAY_BEFORE_COMMIT" ;;
+esac
+if [ -n "$RAW_ROWS" ]; then
+  # Print-before-delete is the deliberate at-least-once no-loss boundary: a
+  # crash in this micro-gap may replay a wake, and annotations stay outside it.
+  printf '%s\n' "$RAW_ROWS" || exit "$?"
+fi
+rm -f "$DRAIN_TMP" || exit "$?"
 DRAIN_TMP=
+fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+DRAIN_LOCK_HELD=false
+
+# Raw output and queue deletion are authoritative. Everything below is
+# best-effort and cannot restore, duplicate, hide, or fail the consumed rows.
+(fm_wake_print_annotations "$RAW_ROWS") || true
 assert_watcher_liveness
 release_queue_lock
 advise_inbox

@@ -8,8 +8,9 @@
 # or blocked and the crew resumes (responds to the gate, the pipeline fixes, it
 # re-validates), the log's last line stays stale. This helper never infers the
 # current state from a tail of the log: it reads the authoritative source (a
-# no-mistakes run-step attributed to this crew's branch, else the pane
-# busy-signature) and reconciles the possibly-stale log against it.
+# no-mistakes run-step attributed to this crew's branch and current code
+# identity, else the pane busy-signature) and reconciles the possibly-stale log
+# against it.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -19,8 +20,14 @@
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
-#   2. Matching no-mistakes run for this crew's branch, active or terminal
-#      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
+#   2. Matching no-mistakes run for this crew's branch AND current code identity,
+#      active or terminal (from `axi status`, or the coarse `no-mistakes runs`
+#      fallback)? Branch name alone is not enough: a historical run on a reused
+#      branch whose head was rewritten or diverged must not be attributed.
+#      A run matches when its head equals the worktree HEAD, or the worktree HEAD
+#      is an ancestor of the run head (pipeline fix commits advanced the run on
+#      the same line of history). Local work that advanced past the run head, or
+#      diverged from it, invalidates attribution.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -33,7 +40,9 @@
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
 #      agree, and are reported as parked.
 #   4. No run for this crew (pre-validation, or kind=scout): fall back to the
-#      recorded backend's pane busy state, then the status log's last line.
+#      recorded backend's pane busy state, then the status log's last line only
+#      when its verb maps to a recognized run-state. Decision-only events such as
+#      `resolved` never become current state or detail.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
@@ -101,18 +110,6 @@ log_last_line() {
   [ -f "$LOG" ] || return 1
   grep -v '^[[:space:]]*$' "$LOG" 2>/dev/null | tail -1
 }
-log_verb_of() {  # <line>
-  local v=${1%%:*}
-  v="${v#"${v%%[![:space:]]*}"}"
-  v="${v%"${v##*[![:space:]]}"}"
-  printf '%s' "$v"
-}
-log_note_of() {  # <line>
-  case "$1" in
-    *:*) local n=${1#*:}; printf '%s' "${n#"${n%%[![:space:]]*}"}" ;;
-    *)   printf '%s' "$1" ;;
-  esac
-}
 # Map a status-log verb onto a canonical state for the fallback path. `paused` is
 # the deliberate-external-wait verb (fm-classify-lib.sh's FM_CLASSIFY_PAUSED_VERB):
 # a crew with no active run and an idle pane that declared a known external wait
@@ -123,7 +120,7 @@ map_log_state() {  # <line>
     echo paused
     return
   fi
-  case "$(log_verb_of "$1")" in
+  case "$(status_line_verb "$1")" in
     working)        echo working ;;
     needs-decision) echo parked ;;
     blocked)        echo blocked ;;
@@ -134,7 +131,7 @@ map_log_state() {  # <line>
 }
 
 LOG_LINE=$(log_last_line || true)
-LOG_VERB=$(log_verb_of "$LOG_LINE")
+LOG_VERB=$(status_line_verb "$LOG_LINE")
 
 # pane_readable is consulted ONLY in the no-run fallback below. The run-step path
 # stays authoritative regardless of pane liveness - judge by the run-step, not the
@@ -163,7 +160,7 @@ pane_readable() {  # <target>
 # which is a narrower signal than "this crew's turn/tool call is still in
 # progress". A crew blocked on its own long-running foreground tool call (e.g.
 # `no-mistakes axi run` without --yes, which blocks synchronously until a gate
-# or outcome - AGENTS.md section 11) is not generating for that whole span, so
+# or outcome - AGENTS.md section 7) is not generating for that whole span, so
 # agent.get can read idle/blocked (bin/backends/herdr.sh maps both to `idle`)
 # while the pane's own rendered text still shows the harness's busy banner
 # (BUSY_REGEX, e.g. "esc to interrupt") for the entire tool call, exactly like
@@ -289,7 +286,7 @@ nm_gate_findings_count() {
 }
 log_reports_ci_ready() {
   [ "$LOG_VERB" = "done" ] || return 1
-  case "$(log_note_of "$LOG_LINE")" in
+  case "$(status_line_note "$LOG_LINE")" in
     *PR*"checks green"*|*"checks green"*PR*) return 0 ;;
     *) return 1 ;;
   esac
@@ -381,7 +378,7 @@ nm_ci_checks_state() {
 # matching row's status word (running/completed/cancelled/failed), or empty
 # when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
 nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br
+  local branch=$1 out row st rest br sha
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 0
   while IFS= read -r row; do
@@ -391,7 +388,15 @@ nm_runs_status_for_branch() {  # <branch>
     rest=${row#* }
     rest=$(trim "$rest")
     br=${rest%% *}
+    rest=${rest#* }
+    rest=$(trim "$rest")
+    sha=${rest%% *}
     if [ "$br" = "$branch" ]; then
+      # Same code-identity rule as axi status: skip a same-branch row whose
+      # short-sha does not match this worktree (rewritten or advanced tip).
+      if ! nm_coarse_head_matches_worktree "$sha"; then
+        continue
+      fi
       printf '%s' "$st"
       return 0
     fi
@@ -402,6 +407,43 @@ nm_runs_status_for_branch() {  # <branch>
 # CREW_BRANCH is empty at detached HEAD (a just-spawned crew, or a scout's
 # scratch worktree); with no branch there is no run to attribute to this crew.
 CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+
+# 0 if the active axi-status run's head field matches this worktree's code
+# identity. Branch match is a precondition (caller). Rules:
+#   - missing/empty head field: cannot bind; reject the run
+#   - equal commits (short or full SHA): match
+#   - worktree HEAD is an ancestor of run head: match (pipeline fix commits on
+#     the same history advanced the run tip)
+#   - run head is a strict ancestor of worktree HEAD: no match (local work
+#     advanced outside the run)
+#   - diverged / run head not in this worktree: no match (rewritten branch tip)
+nm_run_head_matches_worktree() {
+  local run_head local_full run_full
+  run_head=$(strip_quotes "$(nm_field head)")
+  [ -n "$run_head" ] || return 1
+  local_full=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || return 1
+  run_full=$(git -C "$WT" rev-parse --verify "${run_head}^{commit}" 2>/dev/null) || return 1
+  [ "$run_full" = "$local_full" ] && return 0
+  if git -C "$WT" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# Coarse runs-list rows are "<status> <branch> <short-sha> ...". 0 if the short
+# sha for this branch row matches the worktree head under the same rules as
+# nm_run_head_matches_worktree (equal, or local is ancestor of run tip).
+nm_coarse_head_matches_worktree() {  # <short-sha>
+  local run_head=$1 local_full run_full
+  [ -n "$run_head" ] || return 1
+  local_full=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || return 1
+  run_full=$(git -C "$WT" rev-parse --verify "${run_head}^{commit}" 2>/dev/null) || return 1
+  [ "$run_full" = "$local_full" ] && return 0
+  if git -C "$WT" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
 
 HAVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
@@ -416,11 +458,12 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
       HAVE_RUN=1
     else
-      # The active-or-most-recent run is for another branch (the CLI is alive
-      # and answered; only the attribution missed) - try the coarse fallback.
+      # The active-or-most-recent run is for another branch, or same branch with
+      # a rewritten/diverged head (the CLI is alive and answered; only the
+      # attribution missed) - try the coarse fallback.
       # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
@@ -519,7 +562,7 @@ if [ "$HAVE_RUN" = 1 ]; then
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then
     if [ "$RUN_SOURCE" = coarse ]; then
-      emit "done" status-log "$(log_note_of "$LOG_LINE")${SEP}run still monitoring PR"
+      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
     fi
     [ -n "$CI_STEP_STATUS" ] || CI_STEP_STATUS=$(nm_effective_ci_step_status)
     if [ "$RUN_STATUS" = fixing ]; then
@@ -530,7 +573,7 @@ if [ "$HAVE_RUN" = 1 ]; then
       CI_LOG_STATE=not-ready
     fi
     if [ "$CI_LOG_STATE" != not-ready ]; then
-      emit "done" status-log "$(log_note_of "$LOG_LINE")${SEP}run still monitoring PR"
+      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
     fi
   fi
 
@@ -566,8 +609,21 @@ if [ "$KIND" != secondmate ] && crew_pane_is_busy "$BACKEND_TARGET"; then
   emit working pane "harness busy"
 fi
 
+# Fall back to the status log's last line, but ONLY when its verb maps to a real
+# run-state. A decision-closing event - resolved: (fm-classify-lib.sh's
+# FM_CLASSIFY_RESOLVE_VERB), and any future decision-only sibling - is NOT a state:
+# it exists solely to CLOSE a keyed decision in the durable fold, so a trailing
+# resolved: must never become the current state or leak its resolution prose as the
+# detail. Skipping it lets a just-resolved idle crew (typically a secondmate, which
+# has no busy check above) fall through to the idle default instead of rendering
+# `unknown` with the resolution note as `doing`. map_log_state is the single owner of
+# the verb->state mapping (including the configurable paused verb), so reusing its
+# `unknown` verdict as the "not a state" test needs no second verb list here.
 if [ -n "$LOG_VERB" ]; then
-  emit "$(map_log_state "$LOG_LINE")" status-log "$(log_note_of "$LOG_LINE")"
+  LOG_STATE=$(map_log_state "$LOG_LINE")
+  if [ "$LOG_STATE" != unknown ]; then
+    emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
+  fi
 fi
 
 emit unknown none "no current-state source available"

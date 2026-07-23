@@ -531,7 +531,7 @@ test_spawn_refuses_orca_secondmate_before_home_mutation() {
   assert_contains "$out" "backend=orca does not support --secondmate spawns yet" \
     "orca secondmate refusal should happen at backend selection"
   assert_absent "$subhome/config/crew-harness" \
-    "orca secondmate refusal should not propagate inheritable config into the secondmate home"
+    "orca secondmate refusal should not propagate inherited local material into the secondmate home"
   pass "fm-spawn.sh --backend orca --secondmate: refuses before secondmate-home mutation"
 }
 
@@ -665,16 +665,15 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
 }
 
 test_spawn_releases_orca_resources_when_metadata_write_fails() {
-  local proj wt data state_file config id out status
+  local proj wt data state config id out status
   id="orcametafailz9"
   proj="$TMP_ROOT/meta-fail-project"
   wt="$TMP_ROOT/meta-fail-wt"
   data="$TMP_ROOT/meta-fail-data"
-  state_file="$TMP_ROOT/meta-fail-state-file"
+  state="$TMP_ROOT/meta-fail-state"
   config="$TMP_ROOT/meta-fail-config"
   fm_git_worktree "$proj" "$wt" "fm/$id"
-  mkdir -p "$data/$id" "$config"
-  : > "$state_file"
+  mkdir -p "$data/$id" "$state/$id.meta" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
   orca_case meta-fail
   printf '1\n' > "$RESP/1.exit"
@@ -682,17 +681,17 @@ test_spawn_releases_orca_resources_when_metadata_write_fails() {
   printf '{"ok":true,"result":{"worktree":{"id":"wt-meta-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
   printf '{"ok":true,"result":{"terminal":{"handle":"term-meta-fail"}}}\n' > "$RESP/4.out"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
-    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state_file" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "Orca spawn should fail when metadata cannot be written"
-  assert_contains "$out" "File exists" "spawn should fail at the state directory creation point"
+  assert_contains "$out" "Is a directory" "spawn should fail at metadata publication"
   assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-meta-fail'$'\x1f''--json' \
     "Orca spawn should close the recorded terminal when a later abort occurs"
   assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-meta-fail'$'\x1f''--force'$'\x1f''--json' \
     "Orca spawn should remove the recorded worktree when a later abort occurs"
-  assert_absent "$state_file/$id.meta" "metadata-write abort should not leave metadata after successful cleanup"
+  [ ! -f "$state/$id.meta" ] || fail "metadata-write abort should not publish a regular metadata file"
   pass "fm-spawn.sh --backend orca: releases terminal and worktree on later aborts"
 }
 
@@ -788,7 +787,8 @@ test_scout_teardown_removes_orca_worktree_via_helper() {
   fm_write_meta "$state/$id.meta" \
     "window=fm-$id" "terminal=term-teardown" "worktree=$wt" "project=$proj" \
     "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
-    "backend=orca" "orca_worktree_id=wt-teardown"
+    "backend=orca" "orca_worktree_id=wt-teardown" \
+    "decisions_reviewed=1" "decision_keys="
   orca_case teardown
   printf '{"ok":true,"result":{"worktree":{"id":"wt-teardown","path":"%s"}}}\n' "$wt" > "$RESP/1.out"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
@@ -824,7 +824,8 @@ test_scout_teardown_refuses_orca_id_path_mismatch() {
   fm_write_meta "$state/$id.meta" \
     "window=fm-$id" "terminal=term-scout-mismatch" "worktree=$wt" "project=$proj" \
     "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
-    "backend=orca" "orca_worktree_id=wt-scout-mismatch"
+    "backend=orca" "orca_worktree_id=wt-scout-mismatch" \
+    "decisions_reviewed=1" "decision_keys="
   orca_case scout-mismatch
   printf '{"ok":true,"result":{"worktree":{"id":"wt-scout-mismatch","path":"%s"}}}\n' "$other_wt" > "$RESP/1.out"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
@@ -859,7 +860,8 @@ test_teardown_removes_orca_worktree_when_path_missing() {
   fm_write_meta "$state/$id.meta" \
     "window=fm-$id" "terminal=term-missing-path" "worktree=$wt" "project=$proj" \
     "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
-    "backend=orca" "orca_worktree_id=wt-missing-path"
+    "backend=orca" "orca_worktree_id=wt-missing-path" \
+    "decisions_reviewed=1" "decision_keys="
   orca_case missing-path
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   set +e
@@ -891,7 +893,8 @@ test_teardown_preserves_metadata_when_orca_remove_error_json() {
   fm_write_meta "$state/$id.meta" \
     "window=fm-$id" "worktree=$wt" "project=$proj" \
     "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
-    "backend=orca" "orca_worktree_id=wt-remove-error"
+    "backend=orca" "orca_worktree_id=wt-remove-error" \
+    "decisions_reviewed=1" "decision_keys="
   orca_case remove-error-teardown
   printf '{"ok":false,"error":{"code":"worktree_not_removed","message":"worktree not removed"}}\n' > "$RESP/1.out"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
@@ -1092,7 +1095,8 @@ test_teardown_refuses_orca_missing_worktree_id() {
   touch "$state/.last-watcher-beat"
   fm_write_meta "$state/$id.meta" \
     "window=fm-$id" "terminal=term-missing-id" "worktree=$wt" "project=$proj" \
-    "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" "backend=orca"
+    "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" "backend=orca" \
+    "decisions_reviewed=1" "decision_keys="
   orca_case missing-id
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   set +e
@@ -1123,7 +1127,8 @@ test_teardown_removes_orca_worktree_without_terminal_handle() {
   fm_write_meta "$state/$id.meta" \
     "window=fm-$id" "worktree=$wt" "project=$proj" \
     "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
-    "backend=orca" "orca_worktree_id=wt-no-terminal"
+    "backend=orca" "orca_worktree_id=wt-no-terminal" \
+    "decisions_reviewed=1" "decision_keys="
   orca_case no-terminal
   printf '{"ok":true,"result":{"worktree":{"id":"wt-no-terminal","path":"%s"}}}\n' "$wt" > "$RESP/1.out"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
